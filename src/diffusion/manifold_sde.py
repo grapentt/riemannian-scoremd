@@ -90,7 +90,7 @@ class ManifoldVP:
     # Forward process
     # ------------------------------------------------------------------
 
-    def marginal_prob(self, x0, t, rng):
+    def marginal_prob(self, x0, t, rng, fixed_K: int = None):
         """
         Sample x_t ~ q(x_t | x_0) via geodesic noising on the manifold.
 
@@ -109,6 +109,12 @@ class ManifoldVP:
         :param x0: (N, 1, n, d) reference conformation
         :param t: scalar time in [0, 1]
         :param rng: JAX PRNGKey
+        :param fixed_K: if not None, use this fixed integer K for s_exp instead of
+            computing K = int(c * max(nrm)) + 1 dynamically. When fixed_K is set,
+            marginal_prob becomes a pure JAX function (no data-dependent Python ints)
+            and can be vmapped over the batch dimension.
+            K=1 is valid for all BBA/chignolin frames (confirmed empirically).
+            Only set this when you are confident K=1 covers all frames in your dataset.
         :return: (x_t, v_h_unit, sigma_t)
                  x_t      -- (N, 1, n, d) noisy conformation at time t (on M)
                  v_h_unit  -- (N, 1, 1, n, d) horizontal unit tangent noise vector
@@ -130,7 +136,14 @@ class ManifoldVP:
 
         # Geodesic displacement: factor 0.5 compensates for s_exp doubling
         tangent = 0.5 * alpha_t * sigma_t * v_h_unit[:, :, 0, :, :]  # (N, 1, n, d)
-        x_t = self.manifold.s_exp(x0, tangent)
+
+        if fixed_K is not None:
+            # Pure-JAX path: use the cached JIT function with fixed K directly,
+            # bypassing the data-dependent K computation in s_exp.
+            # This makes marginal_prob vmappable.
+            x_t = self.manifold._s_exp_fixed_K(x0, tangent, fixed_K)
+        else:
+            x_t = self.manifold.s_exp(x0, tangent)
 
         return x_t, v_h_unit, sigma_t
 

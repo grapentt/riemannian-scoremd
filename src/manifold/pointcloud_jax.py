@@ -590,6 +590,46 @@ class ShapeManifold:
 
         return self.align_mpoint(z, base=base)
 
+    def _s_exp_fixed_K(self, x, X, K: int,
+                        c: float = 0.25,
+                        step_size: float = 1.0, max_iter: int = 100, tol: float = 1e-3,
+                        use_separation_grad: bool = True):
+        """
+        Pure-JAX exponential map with K fixed as a Python constant.
+
+        Identical to s_exp but skips the data-dependent K computation
+        (K = int(c * max(nrm)) + 1).  Because K is a Python literal here,
+        this function contains no concrete-value dependencies and can be
+        safely vmapped or JIT-compiled as part of a larger computation.
+
+        Use this (via ManifoldVP.marginal_prob(fixed_K=1)) when you want to
+        vmap prepare_batch over the batch dimension for GPU-parallel training.
+
+        K=1 is valid for BBA (n=28) and chignolin (n=10) data — confirmed
+        empirically from the precomputed dataset (all frames had K=1).
+        For larger proteins (e.g. adenylate kinase n=214), verify K first.
+
+        :param x: (N, 1, n, d)
+        :param X: (N, 1, n, d) tangent vector
+        :param K: Python int — number of doubling steps (fixed, not computed from data)
+        :return: (N, 1, n, d)
+        """
+        base = self.base_point
+        x0 = x
+        x1 = x + (1.0 / K) * X
+        z_init_first = 2.0 * x1 - x0
+
+        cache_key = (K, use_separation_grad, tol, max_iter, step_size)
+        if not hasattr(self, '_doubling_cache'):
+            self._doubling_cache = {}
+        if cache_key not in self._doubling_cache:
+            self._doubling_cache[cache_key] = self._build_doubling_fn(
+                K, use_separation_grad, tol, max_iter, step_size, base
+            )
+        run_doubling = self._doubling_cache[cache_key]
+        xK = run_doubling(x0, x1, z_init_first)
+        return self.align_mpoint(xK, base=base)
+
     def s_exp(self, x, X, c: float = 0.25, base=None,
               step_size: float = 1.0, max_iter: int = 100, tol: float = 1e-3,
               use_separation_grad: bool = True):

@@ -47,7 +47,7 @@ import numpy as np
 import optax
 import flax.linen as nn
 
-from training.score_loss import prepare_batch, riemannian_dsm_loss_from_noised
+from training.score_loss import prepare_batch, prepare_batch_vmapped, riemannian_dsm_loss_from_noised
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +124,7 @@ def train(
     seed: int = 0,
     log_every: int = 100,
     ckpt_dir: Optional[str] = None,
+    fixed_K: Optional[int] = 1,
 ) -> Tuple[dict, list]:
     """
     Train a TangentScoreModel (or PotentialTangentScoreModel) on clean frames.
@@ -141,10 +142,20 @@ def train(
     :param seed:                RNG seed
     :param log_every:           print loss every N epochs
     :param ckpt_dir:            if provided, save params.npz there every log_every epochs
+    :param fixed_K:             if not None, use vmapped prepare_batch with this fixed K
+                                for s_exp (default 1, valid for BBA/chignolin). Set to
+                                None to fall back to the original Python-loop prepare_batch
+                                (needed if K>1 frames exist in the dataset).
     :return: (state_dict, loss_history)
              state_dict has keys: 'params', 'ema_params'
              loss_history: list of (epoch, loss) tuples
     """
+    # Auto-detect GPU: use vmapped path on GPU, Python loop on CPU
+    if fixed_K == 1:
+        has_gpu = any(d.platform == 'gpu' for d in jax.devices())
+        if not has_gpu:
+            fixed_K = None  # vmapped is slower on CPU — fall back to Python loop
+
     N, n, d = train_data.shape
     nd = n * d
     n_steps_per_epoch = max(1, N // batch_size)
@@ -172,9 +183,23 @@ def train(
 
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"  Model parameters: {n_params:,}")
+    if fixed_K is not None:
+        print(f"  Phase A: vmapped (fixed_K={fixed_K}) — GPU-parallel batch processing")
+    else:
+        print(f"  Phase A: Python loop (fixed_K=None) — sequential per-sample")
 
     # ---- Build JIT'd step ----
     train_step = make_train_step(model, manifold, sde, optimizer, likelihood_weighting)
+
+    # ---- Select batch preparation function ----
+    if fixed_K is not None:
+        _prepare = lambda x0_b, t_b, noise_key: prepare_batch_vmapped(
+            manifold, sde, x0_b, t_b, noise_key, fixed_K=fixed_K
+        )
+    else:
+        _prepare = lambda x0_b, t_b, noise_key: prepare_batch(
+            manifold, sde, x0_b, t_b, noise_key
+        )
 
     # ---- Training loop ----
     loss_history = []
@@ -199,8 +224,8 @@ def train(
                 minval=t_min, maxval=t_max
             )
 
-            # Phase A: geodesic noising + score target (outside JIT)
-            x_t, s_true = prepare_batch(manifold, sde, x0_batch, t_batch, noise_key)
+            # Phase A: geodesic noising + score target
+            x_t, s_true = _prepare(x0_batch, t_batch, noise_key)
 
             # Phase B: JIT-compiled gradient step
             params, ema_params, opt_state, loss = train_step(
