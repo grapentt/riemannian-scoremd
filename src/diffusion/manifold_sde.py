@@ -147,22 +147,51 @@ class ManifoldVP:
 
         return x_t, v_h_unit, sigma_t
 
-    def score_target(self, x_t, x_0, t):
+    def score_target(self, x_t, x_0, t, use_slog: bool = True):
         """
-        Denoising score matching target in the horizontal tangent space at x_t:
+        Denoising score matching target, projected to the horizontal tangent space at x_t.
 
-            s_true(x_t, x_0, t) = -s_log(x_t, x_0) / sigma(t)^2
+        Two modes:
 
-        Exact by construction: s_log inverts s_exp up to third-order accuracy.
+        use_slog=True (default — production path, precomputed data generation):
+            s_true = -s_log(x_t, x_0, clip_eigs=1e-6) / sigma(t)^2
+
+            s_log applies H^{-1} to prelog, giving the true Riemannian log map and
+            the exact Riemannian gradient of ½w²(x_t, x_0).  clip_eigs=1e-6 repairs
+            the small negative eigenvalues that arise from float arithmetic on real
+            protein data (< 1e-7 leakage after PSD repair + project_G post-step).
+            O((nd)³).  This is the correct choice for all precomputed data generation
+            and any path where cost is amortized.
+
+        use_slog=False (fast fallback — smoke tests / online debugging only):
+            s_true = project_G(-prelog(x_t, x_0)) / sigma(t)^2
+
+            prelog is the flat Euclidean gradient of w²(x_t, x_0).  project_G is
+            horizontal_projection_tvector.  O(n²d), no eigendecomposition.  ~35°
+            per-sample angular difference from s_log.  Same DSM fixed point.
+            Use only when s_log cost is genuinely prohibitive (e.g. online training
+            without precomputed data, or initial smoke tests).
 
         :param x_t: (N, 1, n, d)
         :param x_0: (N, 1, n, d)
         :param t: scalar
-        :return: (N, 1, 1, n, d) score target (horizontal tangent vector at x_t)
+        :param use_slog: if True (default), use s_log (Riemannian gradient). If False,
+            use prelog+project_G (fast fallback for smoke tests / online debugging).
+        :return: (N, 1, 1, n, d) score target (G-horizontal tangent vector at x_t)
         """
         sigma_t = self.sigma(t)
-        log_map = self.manifold.s_log(x_t, x_0)              # (N, 1, 1, n, d)
-        return -log_map / (sigma_t ** 2)
+        if use_slog:
+            # True Riemannian gradient: H^{-1} prelog, PSD-repaired + project_G.
+            # s_log returns (N, 1, 1, n, d) with clip_eigs + project_G post-step.
+            log = self.manifold.s_log(x_t, x_0, clip_eigs=1e-6)  # (N, 1, 1, n, d)
+            return -log / (sigma_t ** 2)
+        else:
+            # Fast path: flat gradient of w² projected to G-basis horizontal space.
+            prelog = self.manifold.s_prelog(x_t, x_0)            # (N, 1, 1, n, d)
+            prelog_h = self.manifold.horizontal_projection_tvector(
+                x_t, prelog                                       # x_t: (N,1,n,d), prelog: (N,1,1,n,d)
+            )                                                     # (N, 1, 1, n, d)
+            return -prelog_h / (sigma_t ** 2)
 
     # ------------------------------------------------------------------
     # Reverse SDE drift (for sampling)

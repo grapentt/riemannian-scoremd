@@ -209,11 +209,24 @@ class ShapeManifold:
     # Layer 2: metric tensor
     # ------------------------------------------------------------------
 
-    def metric_tensor(self, x, asmatrix: bool = False):
+    def metric_tensor(self, x, asmatrix: bool = False,
+                      psd_mode: str = "none", psd_eps: float = 1e-6):
         """
         H = A + alpha * B  (w^delta Riemannian metric)
+
         :param x: (N, M, n, d)
         :param asmatrix: if True return (N, M, nd, nd); else (N, M, n, n, d, d)
+        :param psd_mode: PSD repair applied before returning (only meaningful when
+            asmatrix=True, since repair operates on the flat nd×nd matrix):
+            - "none" (default): no repair, return H as-is.
+            - "clip": eigendecompose H = QΛQ^T, clip Λ_reg = max(Λ, psd_eps),
+              return Q Λ_reg Q^T.  Eliminates negative eigenvalues while changing
+              the metric only in already ill-conditioned directions.
+            - "horiz": add psd_eps * P_horiz where P_horiz = I - P_vert is the
+              projection onto the horizontal complement (from the G-basis projector).
+              Leaves the vertical kernel untouched; raises the minimum horizontal
+              eigenvalue to at least psd_eps without coupling vertical/horizontal.
+        :param psd_eps: regularisation magnitude (default 1e-6)
         :return: see above
         """
         N, M = x.shape[0], x.shape[1]
@@ -244,9 +257,86 @@ class ShapeManifold:
 
         if asmatrix:
             # permute (N,M,n,n,d,d) -> (N,M,n,d,n,d) then reshape to (N,M,nd,nd)
-            H = H.transpose(0, 1, 2, 5, 3, 4)             # (N,M,n,d,n,d)
+            # Fix: (0,1,2,4,3,5) maps (N,M,n_i,n_j,d_a,d_b) -> (N,M,n_i,d_a,n_j,d_b)
+            # giving flat row = i*d+a, col = j*d+b — consistent with G-basis i*d+a indexing.
+            # The previous (0,1,2,5,3,4) swapped the d-indices, breaking ker(H) = V_X.
+            H = H.transpose(0, 1, 2, 4, 3, 5)             # (N,M,n,d,n,d)
             H = H.reshape(N, M, self.n * self.d, self.n * self.d)
+
+            if psd_mode == "clip":
+                # Eigenvalue clipping: clip all eigenvalues to >= psd_eps.
+                # Fixes the bottom-vert_dim cut in s_log when H has negative eigs.
+                Lh, Qh = jnp.linalg.eigh(H)               # (N,M,nd), (N,M,nd,nd)
+                Lh_reg = jnp.maximum(Lh, psd_eps)
+                H = jnp.einsum("NMxy,NMy,NMzy->NMxz", Qh, Lh_reg, Qh)
+
+            elif psd_mode == "horiz":
+                # Horizontal-space stabilizer: H + psd_eps * P_horiz
+                # P_vert = V^T V  where V is the (N,M,vert_dim,nd) vertical basis;
+                # P_horiz = I - P_vert.  This leaves the vertical kernel untouched.
+                P_vert = self._vertical_projection_matrix(x)  # (N,M,nd,nd)
+                nd = self.n * self.d
+                P_horiz = jnp.eye(nd) - P_vert
+                H = H + psd_eps * P_horiz
+
         return H
+
+    def _vertical_projection_matrix(self, x):
+        """
+        Projection matrix P_vert onto the G-basis vertical space.
+
+        Returns the (N, M, nd, nd) matrix P_vert = V^T V, where V is the
+        vert_dim × nd vertical basis constructed by horizontal_projection_tvector.
+        Satisfies: P_vert^2 = P_vert, rank = vert_space_dimension.
+
+        Used by metric_tensor(psd_mode="horiz") to form P_horiz = I - P_vert.
+
+        :param x: (N, M, n, d)
+        :return: (N, M, nd, nd)
+        """
+        N, M = x.shape[0], x.shape[1]
+        nd = self.n * self.d
+        vert_dim = self.vert_space_dimension
+
+        xc = self.center_mpoint(x)
+        G = self.gyration_matrix(x)                          # (N,M,d,d)
+        L, Q = jnp.linalg.eigh(G)                           # (N,M,d), (N,M,d,d)
+
+        # Translation basis: d vectors, shape (N,M,d,nd)
+        e = jnp.eye(self.d)
+        trans_basis = jnp.broadcast_to(
+            e[None, None, None, :, :] / self.n ** 0.5,
+            (N, M, self.n, self.d, self.d),
+        ).transpose(0, 1, 3, 2, 4).reshape(N, M, self.d, nd)  # (N,M,d,nd)
+
+        # Rotation basis: d*(d-1)/2 vectors, shape (N,M,d*(d-1)/2,nd)
+        rot_parts = []
+        Ld = jnp.einsum("ab,NMa->NMab", jnp.eye(self.d), L ** (-0.5))
+        for i in range(self.d):
+            for j in range(i + 1, self.d):
+                Gij = jnp.zeros((self.d, self.d))
+                Gij = Gij.at[i, j].set(1.0)
+                Gij = Gij.at[j, i].set(-1.0)
+                QLGijLQt = Q @ Ld @ Gij[None, None] @ Ld @ jnp.swapaxes(Q, -1, -2)
+                norm_factor = jnp.sqrt(
+                    (L[:, :, i] * L[:, :, j]) / (L[:, :, i] + L[:, :, j])
+                )[:, :, None, None]
+                vij = jnp.einsum(
+                    "NMab,NMib->NMia", norm_factor * QLGijLQt, xc
+                )                                            # (N,M,n,d)
+                rot_parts.append(vij.reshape(N, M, nd))     # (N,M,nd)
+
+        rot_basis = jnp.stack(rot_parts, axis=2)            # (N,M,d*(d-1)/2,nd)
+
+        # Full vertical basis: (N,M,vert_dim,nd)
+        vertical_basis_flat = jnp.concatenate(
+            [trans_basis, rot_basis], axis=2
+        )                                                    # (N,M,vert_dim,nd)
+
+        # P_vert = V^T V  (sum over vert_dim basis vectors)
+        P_vert = jnp.einsum("NMva,NMvb->NMab",
+                            vertical_basis_flat, vertical_basis_flat)
+        return P_vert                                        # (N,M,nd,nd)
 
     # ------------------------------------------------------------------
     # Layer 3: distance, prelog, log
@@ -329,20 +419,52 @@ class ShapeManifold:
             return result.reshape(N, M, MM, self.n * self.d)
         return result
 
-    def s_log(self, x, y, asvector: bool = False):
+    def s_log(self, x, y, asvector: bool = False,
+              clip_eigs=None, horiz_stabilize: bool = False,
+              psd_eps: float = 1e-6):
         """
         Approximate Riemannian log map: H^{-1} prelog  (restricted to horizontal space).
+
         :param x: (N, M, n, d)
         :param y: (N, M', n, d)
         :param asvector: if True return (N, M, M', n*d)
+        :param clip_eigs: if not None, repair H by clipping all eigenvalues to >= clip_eigs
+            before pseudo-inversion (psd_mode="clip" in metric_tensor).  Eliminates
+            negative eigenvalues.  After inversion, the result is additionally projected
+            with horizontal_projection_tvector (project_G) to enforce exact G-basis
+            horizontality — this is necessary because the H-eigenvector cut does not
+            perfectly align with the G-basis kernel even after clipping.
+            Typical value: 1e-6.  Default None = no repair (original behavior).
+        :param horiz_stabilize: if True, repair H by adding psd_eps * P_horiz before
+            pseudo-inversion (psd_mode="horiz" in metric_tensor).  Same post-projection
+            as clip_eigs for G-basis consistency.
+            If both clip_eigs and horiz_stabilize are set, horiz_stabilize wins.
+        :param psd_eps: regularisation magnitude (default 1e-6).
         :return: (N, M, M', n, d) or (N, M, M', n*d)
+
+        Note on leakage:
+          The H-eigenvector cut (bottom-vert_dim eigenvectors discarded) doesn't exactly
+          span the G-basis vertical space V_X, even after PSD repair.  Without repair:
+          ~3.7% leakage.  With repair + project_G: < 1e-7 (machine zero).
+          Without either repair: original behavior, ~3.7% leakage (for analysis/reference).
         """
         N, M = x.shape[0], x.shape[1]
         MM = y.shape[1]
         vert_dim = self.vert_space_dimension
+        apply_project_G = (clip_eigs is not None) or horiz_stabilize
 
         prelog = self.s_prelog(x, y, asvector=True)          # (N,M,M',nd)
-        H = self.metric_tensor(x, asmatrix=True)             # (N,M,nd,nd)
+
+        # Select H repair mode
+        if horiz_stabilize:
+            H = self.metric_tensor(x, asmatrix=True,
+                                   psd_mode="horiz", psd_eps=psd_eps)
+        elif clip_eigs is not None:
+            H = self.metric_tensor(x, asmatrix=True,
+                                   psd_mode="clip", psd_eps=float(clip_eigs))
+        else:
+            H = self.metric_tensor(x, asmatrix=True)         # original behavior
+
         L, Q = jnp.linalg.eigh(H)                           # ascending eigs
 
         # Solve H * log = prelog in horizontal space only (skip bottom vert_dim eigenvectors)
@@ -353,6 +475,16 @@ class ShapeManifold:
             Q[:, :, :, vert_dim:],
             prelog,
         )                                                     # (N,M,M',nd)
+
+        if apply_project_G:
+            # Post-project to G-basis horizontal space: the H-eigenvector cut doesn't
+            # perfectly align with the G-basis kernel, so H^{-1} prelog may have
+            # residual vertical leakage.  project_G brings it to < 1e-7.
+            log_nd = log.reshape(N, M, MM, self.n, self.d)   # (N,M,M',n,d)
+            log_nd = self.horizontal_projection_tvector(x, log_nd)  # (N,M,M',n,d)
+            if asvector:
+                return log_nd.reshape(N, M, MM, self.n * self.d)
+            return log_nd
 
         if asvector:
             return log

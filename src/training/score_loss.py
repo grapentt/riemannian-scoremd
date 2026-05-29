@@ -86,13 +86,16 @@ def prepare_batch_vmapped(manifold, sde, x0: jnp.ndarray, t: jnp.ndarray,
 # ---------------------------------------------------------------------------
 
 def prepare_batch(manifold, sde, x0: jnp.ndarray, t: jnp.ndarray,
-                  rng: jax.random.PRNGKey):
+                  rng: jax.random.PRNGKey, use_slog: bool = True):
     """
     Run marginal_prob and score_target for each sample.
     Must be called OUTSIDE jax.jit (s_exp/s_log need concrete K).
 
     :param x0: (B, n, d)
     :param t:  (B,) diffusion times
+    :param use_slog: if True (default), use s_log (Riemannian gradient) for score
+        targets — geometrically correct, O((nd)³), recommended for all production use.
+        Set False only for smoke tests or online training where eigh cost is prohibitive.
     :return:   (x_t, s_true) each (B, n, d)
     """
     B = x0.shape[0]
@@ -103,8 +106,8 @@ def prepare_batch(manifold, sde, x0: jnp.ndarray, t: jnp.ndarray,
     for i in range(B):
         xi = x0[i:i+1, None]               # (1, 1, n, d)
         ti = t[i]
-        x_t_i, _, _ = sde.marginal_prob(xi, ti, rng_keys[i])   # (1, 1, n, d)
-        s_t_i = sde.score_target(x_t_i, xi, ti)                 # (1, 1, 1, n, d)
+        x_t_i, _, _ = sde.marginal_prob(xi, ti, rng_keys[i])              # (1, 1, n, d)
+        s_t_i = sde.score_target(x_t_i, xi, ti, use_slog=use_slog)        # (1, 1, 1, n, d)
 
         x_t_list.append(x_t_i[0, 0])       # (n, d)
         s_true_list.append(s_t_i[0, 0, 0]) # (n, d)
@@ -174,6 +177,71 @@ def riemannian_dsm_loss_from_noised(
         norms_sq = jnp.sum(residual ** 2, axis=(-2, -1))
 
     # ---- Time weighting: w(t) = beta(t) ----
+    if likelihood_weighting:
+        norms_sq = norms_sq * jax.vmap(sde.beta)(t)
+
+    return jnp.mean(norms_sq)
+
+
+# ---------------------------------------------------------------------------
+# Flat (Euclidean) baseline: Phase A + B without any manifold geometry
+# ---------------------------------------------------------------------------
+
+def prepare_batch_flat(sde, x0: jnp.ndarray, t: jnp.ndarray,
+                       rng: jax.random.PRNGKey):
+    """
+    Euclidean VP-SDE batch preparation — no geodesics, no manifold.
+    Fully vmappable (pure JAX).
+
+    Forward process: x_t = alpha(t)*x0 + sigma(t)*eps,  eps ~ N(0,I)
+    Score target:    s_true = -(x_t - alpha(t)*x0) / sigma(t)^2
+                            = -eps / sigma(t)
+
+    :param x0: (B, n, d)
+    :param t:  (B,) diffusion times
+    :param rng: JAX PRNGKey
+    :return: (x_t, s_true) each (B, n, d)
+    """
+    B = x0.shape[0]
+    eps = jax.random.normal(rng, x0.shape)            # (B, n, d)
+
+    # Per-sample alpha/sigma — vmap over batch
+    alpha_t = jax.vmap(sde.alpha)(t)                  # (B,)
+    sigma_t = jax.vmap(sde.sigma)(t)                  # (B,)
+
+    a = alpha_t[:, None, None]                         # (B, 1, 1)
+    s = sigma_t[:, None, None]                         # (B, 1, 1)
+
+    x_t   = a * x0 + s * eps                          # (B, n, d)
+    s_true = -eps / s                                  # (B, n, d)
+
+    return x_t, s_true
+
+
+def flat_dsm_loss_from_noised(
+    score_fn,
+    sde,
+    x_t: jnp.ndarray,
+    s_true: jnp.ndarray,
+    t: jnp.ndarray,
+    likelihood_weighting: bool = True,
+) -> jnp.ndarray:
+    """
+    Flat (Euclidean) DSM loss — no manifold projection.
+    JIT-friendly counterpart to riemannian_dsm_loss_from_noised.
+
+    :param score_fn: (x_flat: (B,nd), t_col: (B,1)) -> (B,nd)
+    :param x_t:     (B, n, d)
+    :param s_true:  (B, n, d)
+    :param t:       (B,)
+    :return: scalar loss
+    """
+    B, n, d = x_t.shape
+    x_flat = x_t.reshape(B, n * d)
+    s_pred = score_fn(x_flat, t.reshape(B, 1)).reshape(B, n, d)
+
+    norms_sq = jnp.sum((s_pred - s_true) ** 2, axis=(-2, -1))  # (B,)
+
     if likelihood_weighting:
         norms_sq = norms_sq * jax.vmap(sde.beta)(t)
 

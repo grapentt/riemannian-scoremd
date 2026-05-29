@@ -72,9 +72,15 @@ class TangentScoreModel(nn.Module):
     Output:  Dense(n*d)  — raw vector, projected horizontal in the loss
 
     Default: hidden_dims=(256, 256, 256, 256), activation=nn.tanh
+
+    output_scale: multiply the final layer output by this constant.
+        E[||s_true||_E] ≈ 3.1 for BBA (measured from precomputed data).
+        The default lecun_normal init gives comparable Euclidean output magnitude,
+        so output_scale=1.0 is fine for BBA. Adjust if needed for other proteins.
     """
     hidden_dims: Sequence[int] = (256, 256, 256, 256)
     activation: callable = nn.tanh
+    output_scale: float = 1.0
 
     @nn.compact
     def __call__(self, x_flat: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
@@ -90,7 +96,7 @@ class TangentScoreModel(nn.Module):
             h = nn.Dense(dim)(h)
             h = self.activation(h)
 
-        return nn.Dense(x_flat.shape[-1])(h)     # (B, n*d)
+        return self.output_scale * nn.Dense(x_flat.shape[-1])(h)  # (B, n*d)
 
 
 # ---------------------------------------------------------------------------
