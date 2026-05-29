@@ -76,15 +76,26 @@ The resulting score can be used both for **generation** and directly as a physic
 src/
   manifold/
     pointcloud_jax.py    — ShapeManifold: the w^delta manifold in JAX
-  diffusion/             — (Phase 2) ManifoldVP forward process, Euler–Maruyama
-  models/                — (Phase 3) TangentScoreModel, conservative parameterization
-  training/              — (Phase 3) Riemannian DSM loss, training loop
-  sampling/              — (Phase 5) reverse SDE, transition path generation
-  evaluation/            — (Phase 5) metrics, baseline comparison
+  diffusion/
+    manifold_sde.py      — ManifoldVP (geodesic-wrapped VP forward process)
+    manifold_solvers.py  — ManifoldEulerMaruyama
+  models/
+    tangent_mlp.py       — TangentScoreModel + PotentialTangentScoreModel (conservative)
+  training/
+    score_loss.py        — Riemannian DSM (G-projection + Phase A/B split)
+    train_manifold.py    — training loop + precomputed data path
 
 tests/
-  test_port_parity.py    — numerical correctness checks for ShapeManifold
-  test_brownian_motion.py — (Phase 2) BM validation: gyration, distances, diffusion coeff
+  test_port_parity.py        — parity vs Diepeveen PyTorch (all primitives)
+  test_brownian_motion.py    — BM geometry preservation (gyration, distances, MSD)
+  test_separation_geodesic.py — s_prelog accuracy in geodesic loop
+  test_data_loading.py       — DE Shaw chignolin + BBA validation
+  test_score_model.py        — chignolin smoke test for TangentScoreModel + DSM loss
+```
+
+Data & runs (git-ignored):
+- `data/precomputed/bba/` — 63k frames × 10 pre-noised repeats (for fast training)
+- `runs/bba_phase36/` — 3000-epoch BBA training (256^4 model) + loss_history.json
 ```
 
 ---
@@ -93,13 +104,19 @@ tests/
 
 | Phase | Description | Status |
 |---|---|---|
-| 0 | Environment setup, reference reproduction | Complete |
-| 1 | $w^\delta$ `ShapeManifold` in JAX, correctness verified | **Complete** |
-| 2 | Manifold forward process (wrapped-Gaussian BM) | Next |
-| 3 | Score network in tangent bundle, Riemannian DSM loss | — |
-| 4 | Manifold Fokker–Planck loss (Laplace–Beltrami correction) | — |
-| 5 | End-to-end sampling, transition paths, evaluation | — |
-| 6 | Scaling to helicase, ablations, arXiv preprint | — |
+| 0–2.5 | JAX port + manifold forward process + s_exp optimisation (2.6 ms) | **Complete** (21/21 geometry tests) |
+| 2.6 | Data acquisition (DE Shaw chignolin + BBA) + pipeline validation | **Complete** |
+| 3 | Tangent-space score network + Riemannian DSM loss | **Code complete**; 3000-epoch BBA training run executed using buggy targets (see `runs/bba_phase36/` + README caveat + THEORY.md §12) |
+| 4 | Manifold Fokker–Planck loss (full Laplace–Beltrami derivation) | **Blocked** — requires analytic derivation from Kolmogorov forward equation |
+| 5–6 | End-to-end sampling, baselines (vs ScoreMD on BBA, Xu 2026 on AK), scaling, arXiv | Not started |
+
+**Latest experiment (with important caveat)**: `runs/bba_phase36/` — 256^4 non-conservative `TangentScoreModel` trained 3000 epochs on 63k BBA frames using precomputed targets generated with the old `s_log` (H-eig cut). On real data at α=1.0 this produced inconsistent targets due to the H-vs-G vertical space mismatch. Loss ~105 but cosine similarity to correct targets ≈ 0. The fix (prelog + explicit `project_G`) was implemented afterwards. See the **unified** `THEORY.md` §12 (now the single authoritative source, with all evidence and resolution paths) + `APPROXIMATIONS.md` for the full story. A clean re-train on corrected targets is required before interpreting results.
+
+### Known implementation subtleties (read before modifying loss or projection code)
+- On real folded protein data with α=1.0 the metric tensor H is **indefinite** (4–5 small negative eigenvalues). The bottom-(nd-6) eigenvectors of H do **not** coincide with the true 6-dimensional vertical space of rigid motions. The explicit G-basis `horizontal_projection_tvector` (used throughout training and `score_target`) is the correct projector; the old H-eig cut inside `s_log` leaks vertical components.
+- Riemannian (g-norm) DSM loss is numerically unstable (cond(H) ~ 10^7–10^8). Current production path uses Euclidean norm on the horizontally-projected residual (identical fixed point).
+- `s_exp` / `s_log` are **not vmappable** (Python-level `K = int(...)`). Two supported training paths exist: (1) precompute noised data once then `train_from_precomputed`, (2) `prepare_batch_vmapped` with `fixed_K=1` (valid for BBA/chignolin).
+- See the **unified** `THEORY.md` (especially §12 on the H-vs-G mismatch, now the single source of truth with all evidence integrated) and `APPROXIMATIONS.md` for the complete picture. The previously scattered diagnostic documents (`H_REPAIR.md`, `bug_diagnostic.md`, etc.) have been superseded.
 
 ---
 
