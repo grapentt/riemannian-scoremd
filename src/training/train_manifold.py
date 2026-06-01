@@ -341,6 +341,15 @@ def train_flat(
 
     Phase A (prepare_batch_flat) is pure JAX and fully vmappable — much faster
     than the Riemannian path even on CPU. Phase B is identical.
+
+    TODO (future): add time_weighting analogous to ScoreMD's `time_weighting(ts)` in
+    scoremd/src/scoremd/diffusion/classic/utils.py (line 253). ScoreMD reweights the
+    loss by a function of t to balance gradient contributions — upweighting time steps
+    where the score is hard to learn (near t=0). Our uniform weighting slightly
+    over-represents large-t (easy, near-noise regime). Effect: slightly slower convergence
+    near t=0, not a correctness issue. Implementing it requires choosing a weighting
+    schedule; ScoreMD uses a fixed function tied to their VP SDE parameters.
+    The same TODO applies to train_from_precomputed.
     """
     N, n, d = train_data.shape
     nd = n * d

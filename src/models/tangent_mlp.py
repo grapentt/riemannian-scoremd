@@ -73,6 +73,13 @@ class TangentScoreModel(nn.Module):
 
     Default: hidden_dims=(256, 256, 256, 256), activation=nn.tanh
 
+    input_scale: fixed divisor applied to x_flat before the first layer.
+        BBA training data has x_t std ≈ 6.26 Å. With lecun_normal init (weight
+        std = 1/sqrt(fan_in) ≈ 0.107), the raw pre-activation std ≈ 5.7 → 60%
+        of tanh neurons saturated at init → near-zero gradients through layer 0.
+        Dividing by input_scale=6.26 brings pre-act std ≈ 0.93 → <1% saturation.
+        Set to 1.0 to disable. Does NOT affect the output scale.
+
     output_scale: multiply the final layer output by this constant.
         E[||s_true||_E] ≈ 3.1 for BBA (measured from precomputed data).
         The default lecun_normal init gives comparable Euclidean output magnitude,
@@ -80,6 +87,7 @@ class TangentScoreModel(nn.Module):
     """
     hidden_dims: Sequence[int] = (256, 256, 256, 256)
     activation: callable = nn.tanh
+    input_scale: float = 6.26
     output_scale: float = 1.0
 
     @nn.compact
@@ -90,7 +98,7 @@ class TangentScoreModel(nn.Module):
         :return:       (B, n*d)
         """
         t_emb = sinusoidal_time_embed(t)         # (B, 4)
-        h = jnp.concatenate([x_flat, t_emb], axis=-1)
+        h = jnp.concatenate([x_flat / self.input_scale, t_emb], axis=-1)
 
         for dim in self.hidden_dims:
             h = nn.Dense(dim)(h)
@@ -119,12 +127,13 @@ class PotentialTangentScoreModel(nn.Module):
     """
     hidden_dims: Sequence[int] = (256, 256, 256, 256)
     activation: callable = nn.tanh
+    input_scale: float = 6.26
 
     @nn.compact
     def _energy(self, x_flat: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
         """Scalar energy E_theta(x, t). :return: (B, 1)"""
         t_emb = sinusoidal_time_embed(t)
-        h = jnp.concatenate([x_flat, t_emb], axis=-1)
+        h = jnp.concatenate([x_flat / self.input_scale, t_emb], axis=-1)
 
         for dim in self.hidden_dims:
             h = nn.Dense(dim)(h)
