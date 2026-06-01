@@ -69,7 +69,8 @@ def ema_update(ema_params, new_params, decay: float = 0.995):
 # One training step (JIT-compiled)
 # ---------------------------------------------------------------------------
 
-def make_train_step(model, manifold, sde, optimizer, likelihood_weighting=True):
+def make_train_step(model, manifold, sde, optimizer, likelihood_weighting=True,
+                    normalize_targets=False, eps_parameterization=False):
     """
     Returns a JIT-compiled train_step function.
     Phase A (prepare_batch: s_exp/s_log) is called OUTSIDE this step.
@@ -96,6 +97,8 @@ def make_train_step(model, manifold, sde, optimizer, likelihood_weighting=True):
                 s_true=s_true,
                 t=t_batch,
                 likelihood_weighting=likelihood_weighting,
+                normalize_targets=normalize_targets,
+                eps_parameterization=eps_parameterization,
             )
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -205,7 +208,8 @@ def train(
         print(f"  normalize_gyration=True: frames rescaled to unit gyration radius per batch")
 
     # ---- Build JIT'd step ----
-    train_step = make_train_step(model, manifold, sde, optimizer, likelihood_weighting)
+    train_step = make_train_step(model, manifold, sde, optimizer, likelihood_weighting,
+                                 normalize_targets=False, eps_parameterization=False)
 
     # ---- Select batch preparation function ----
     # NOTE: online train() uses use_slog=False (prelog, fast) because s_log (eigh
@@ -472,6 +476,8 @@ def train_from_precomputed(
     grad_clip: float = 1.0,
     ema_decay: float = 0.995,
     likelihood_weighting: bool = True,
+    normalize_targets: bool = False,
+    eps_parameterization: bool = False,
     seed: int = 0,
     log_every: int = 100,
     ckpt_dir: Optional[str] = None,
@@ -488,6 +494,13 @@ def train_from_precomputed(
     :param model: Flax nn.Module (TangentScoreModel or variant)
     :param manifold: ShapeManifold instance (needed for loss computation)
     :param sde: ManifoldVP instance (needed for beta(t) weighting)
+    :param normalize_targets: if True, normalize both s_pred and s_true to unit
+           Euclidean norm before computing the residual (direction-only loss).
+           Removes the zero-output attractor. likelihood_weighting is ignored.
+    :param eps_parameterization: if True, predict v_h_unit (unit-g-norm noise
+           direction) rather than the raw score. Converts s_true → v_h_unit at
+           training time via v = s_true * sigma(t) / alpha(t). No time weighting.
+           Recommended long-term fix. likelihood_weighting is ignored.
     :return: (state_dict, loss_history)
     """
     import glob as _glob
@@ -541,7 +554,9 @@ def train_from_precomputed(
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     print(f"  Model parameters: {n_params:,}")
 
-    train_step = make_train_step(model, manifold, sde, optimizer, likelihood_weighting)
+    train_step = make_train_step(model, manifold, sde, optimizer, likelihood_weighting,
+                                 normalize_targets=normalize_targets,
+                                 eps_parameterization=eps_parameterization)
 
     loss_history = []
     t0_wall = time.time()

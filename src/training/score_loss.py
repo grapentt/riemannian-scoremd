@@ -128,6 +128,8 @@ def riemannian_dsm_loss_from_noised(
     t: jnp.ndarray,
     likelihood_weighting: bool = True,
     use_riemannian_norm: bool = False,
+    normalize_targets: bool = False,
+    eps_parameterization: bool = False,
 ) -> jnp.ndarray:
     """
     Riemannian DSM loss given pre-noised x_t and score targets.
@@ -135,13 +137,30 @@ def riemannian_dsm_loss_from_noised(
 
     :param score_fn: (x_flat: (B,nd), t_col: (B,1)) -> (B,nd)
     :param x_t:      (B, n, d) noisy conformations
-    :param s_true:   (B, n, d) score targets
+    :param s_true:   (B, n, d) score targets (s_log / sigma^2)
     :param t:        (B,) diffusion times
-    :param likelihood_weighting: if True, weight each sample by beta(t)
+    :param likelihood_weighting: if True, weight each sample by beta(t).
+           Has no effect when normalize_targets=True or eps_parameterization=True,
+           since those losses are already scale-invariant.
     :param use_riemannian_norm: if True, use g-norm (theoretical, but numerically
            unstable due to near-zero metric eigenvalues). Default False: Euclidean
            norm on projected horizontal residual. Both converge to the same score.
-    :return:         scalar loss
+    :param normalize_targets: if True, normalize both s_pred_h and s_true_h to unit
+           Euclidean norm before computing the residual. Equivalent to maximizing
+           cosine similarity between prediction and target direction. Removes the
+           zero-output attractor (zero has undefined direction → infinite loss).
+           Loss range [0, 4]; likelihood_weighting is ignored when this is True.
+           Use as a quick diagnostic before switching to eps_parameterization.
+    :param eps_parameterization: if True, the network is treated as predicting
+           v_h_unit (the unit-g-norm noise direction) rather than the raw score.
+           s_true is converted to v_h_unit via: v = s_true * sigma(t) / alpha(t).
+           The loss is E[||s_pred_h - v_h_unit||^2] with no time weighting (targets
+           have constant Euclidean norm ~2.81 regardless of t, so no reweighting is
+           needed). At inference, recover the score as s = -alpha(t)/sigma(t) * s_pred.
+           This is the Riemannian analogue of the DDPM epsilon-parameterization and
+           is the recommended long-term fix for the zero-output basin collapse.
+           likelihood_weighting is ignored when this is True.
+    :return: scalar loss
     """
     B, n, d = x_t.shape
 
@@ -160,7 +179,31 @@ def riemannian_dsm_loss_from_noised(
     s_true_h = jax.vmap(project_h)(x_t[:, None], s_true)
     s_pred_h = jax.vmap(project_h)(x_t[:, None], s_pred)
 
-    # ---- Squared error ----
+    # ---- eps-parameterization: convert s_true → v_h_unit ----
+    if eps_parameterization:
+        # v_h_unit = s_true * sigma(t) / alpha(t)
+        # ||v_h_unit||_E ≈ 2.81 for BBA, constant across t (verified empirically).
+        alpha_t = jax.vmap(sde.alpha)(t)[:, None, None]   # (B,1,1)
+        sigma_t = jax.vmap(sde.sigma)(t)[:, None, None]   # (B,1,1)
+        target_h = s_true_h * sigma_t / alpha_t            # (B, n, d)
+        residual = s_pred_h - target_h
+        norms_sq = jnp.sum(residual ** 2, axis=(-2, -1))  # no time weighting needed
+        return jnp.mean(norms_sq)
+
+    # ---- Normalized loss: direction-only (cosine similarity) ----
+    if normalize_targets:
+        eps = 1e-8
+        s_true_norm = s_true_h / (jnp.linalg.norm(
+            s_true_h.reshape(B, -1), axis=-1, keepdims=True
+        ).reshape(B, 1, 1) + eps)
+        s_pred_norm = s_pred_h / (jnp.linalg.norm(
+            s_pred_h.reshape(B, -1), axis=-1, keepdims=True
+        ).reshape(B, 1, 1) + eps)
+        residual = s_pred_norm - s_true_norm
+        norms_sq = jnp.sum(residual ** 2, axis=(-2, -1))  # range [0, 4]
+        return jnp.mean(norms_sq)
+
+    # ---- Standard loss ----
     residual = s_pred_h - s_true_h
 
     if use_riemannian_norm:
