@@ -288,7 +288,8 @@ def train(
 # Flat (Euclidean) baseline training — same architecture, no manifold geometry
 # ---------------------------------------------------------------------------
 
-def make_flat_train_step(model, sde, optimizer, likelihood_weighting=True):
+def make_flat_train_step(model, sde, optimizer, likelihood_weighting=True,
+                         normalize_targets=False):
     """JIT-compiled flat DSM train step (Euclidean VP-SDE, no manifold)."""
 
     @jax.jit
@@ -302,6 +303,7 @@ def make_flat_train_step(model, sde, optimizer, likelihood_weighting=True):
                 s_true=s_true,
                 t=t_batch,
                 likelihood_weighting=likelihood_weighting,
+                normalize_targets=normalize_targets,
             )
 
         loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -326,6 +328,7 @@ def train_flat(
     t_max: float = 0.99,
     ema_decay: float = 0.995,
     likelihood_weighting: bool = True,
+    normalize_targets: bool = True,
     seed: int = 0,
     log_every: int = 100,
     ckpt_dir: Optional[str] = None,
@@ -378,7 +381,8 @@ def train_flat(
     print(f"  Model parameters: {n_params:,}")
     print(f"  Phase A: Euclidean (vmapped, no geodesics)")
 
-    train_step = make_flat_train_step(model, sde, optimizer, likelihood_weighting)
+    train_step = make_flat_train_step(model, sde, optimizer, likelihood_weighting,
+                                      normalize_targets)
 
     loss_history = []
     t0_wall = time.time()

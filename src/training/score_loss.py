@@ -268,6 +268,7 @@ def flat_dsm_loss_from_noised(
     s_true: jnp.ndarray,
     t: jnp.ndarray,
     likelihood_weighting: bool = True,
+    normalize_targets: bool = False,
 ) -> jnp.ndarray:
     """
     Flat (Euclidean) DSM loss — no manifold projection.
@@ -277,16 +278,26 @@ def flat_dsm_loss_from_noised(
     :param x_t:     (B, n, d)
     :param s_true:  (B, n, d)
     :param t:       (B,)
+    :param normalize_targets: if True, normalize both s_pred and s_true to unit
+        vectors before computing the loss. Eliminates the 1/sigma(t) amplitude
+        variation in s_true (which blows up at small t) and makes the zero-output
+        loss = 2 regardless of t. Same logic as the Riemannian path.
     :return: scalar loss
     """
     B, n, d = x_t.shape
     x_flat = x_t.reshape(B, n * d)
     s_pred = score_fn(x_flat, t.reshape(B, 1)).reshape(B, n, d)
 
-    norms_sq = jnp.sum((s_pred - s_true) ** 2, axis=(-2, -1))  # (B,)
-
-    if likelihood_weighting:
-        norms_sq = norms_sq * jax.vmap(sde.beta)(t)
+    if normalize_targets:
+        s_pred_flat = s_pred.reshape(B, -1)
+        s_true_flat = s_true.reshape(B, -1)
+        s_pred_flat = s_pred_flat / (jnp.linalg.norm(s_pred_flat, axis=-1, keepdims=True) + 1e-8)
+        s_true_flat = s_true_flat / (jnp.linalg.norm(s_true_flat, axis=-1, keepdims=True) + 1e-8)
+        norms_sq = jnp.sum((s_pred_flat - s_true_flat) ** 2, axis=-1)  # (B,)
+    else:
+        norms_sq = jnp.sum((s_pred - s_true) ** 2, axis=(-2, -1))  # (B,)
+        if likelihood_weighting:
+            norms_sq = norms_sq * jax.vmap(sde.beta)(t)
 
     return jnp.mean(norms_sq)
 
