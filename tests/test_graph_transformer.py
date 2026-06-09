@@ -2,9 +2,10 @@
 Tests for GraphTransformerScoreModel.
 
 Gates:
-  1. Forward pass: correct shape, finite output
-  2. Loss finite on a single batch
-  3. Loss decreases over 200 epochs on small synthetic dataset
+  1. Forward pass (both modes): correct shape, finite output
+  2. Loss finite on a single batch (both modes)
+  3. Loss decreases over 200 epochs (non-conservative, fast)
+  4. Both modes produce same-shape output; conservative ≠ non-conservative at init
 
 Usage:
     pytest riemannian-scoremd/tests/test_graph_transformer.py -v
@@ -89,81 +90,80 @@ def make_noised_batch(manifold, sde, x0, B: int = 8, seed: int = 1):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Forward pass
+# Test 1: Forward pass — both conservative and non-conservative modes
 # ---------------------------------------------------------------------------
 
 def test_forward_pass():
-    """GraphTransformerScoreModel: correct output shape and finite values."""
+    """GraphTransformerScoreModel: correct output shape and finite values (both modes)."""
     B = 4
-    model = GraphTransformerScoreModel(n=N_ATOMS, d=D, hidden_dim=32, num_layers=1,
-                                       num_heads=4, dim_head=8)
-
     x_flat = jnp.ones((B, ND))
     t_col  = 0.5 * jnp.ones((B, 1))
 
-    params = model.init(jax.random.PRNGKey(0), x_flat, t_col)
-    out = model.apply(params, x_flat, t_col)
+    for conservative in [False, True]:
+        model = GraphTransformerScoreModel(n=N_ATOMS, d=D, hidden_dim=32, num_layers=1,
+                                           num_heads=4, dim_head=8,
+                                           conservative=conservative)
+        params = model.init(jax.random.PRNGKey(0), x_flat, t_col)
+        out = model.apply(params, x_flat, t_col)
 
-    assert out.shape == (B, ND), f"Expected ({B}, {ND}), got {out.shape}"
-    assert bool(jnp.all(jnp.isfinite(out))), "Non-finite output"
+        assert out.shape == (B, ND), f"conservative={conservative}: expected ({B},{ND}), got {out.shape}"
+        assert bool(jnp.all(jnp.isfinite(out))), f"conservative={conservative}: non-finite output"
+        print(f"  ✓ forward pass conservative={conservative}: shape={out.shape}  PASS")
 
-    print(f"  ✓ forward pass: shape={out.shape}, finite=True  PASS")
     return True
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Loss finite on single batch
+# Test 2: Loss finite — both modes
 # ---------------------------------------------------------------------------
 
 def test_loss_finite():
-    """DSM loss is finite for a small batch with GraphTransformerScoreModel."""
+    """DSM loss is finite for a small batch with both model modes."""
     x0 = make_synthetic_bba(N=32, seed=0)
     manifold, sde = make_manifold_and_sde(x0)
 
-    model = GraphTransformerScoreModel(n=N_ATOMS, d=D, hidden_dim=32, num_layers=1,
-                                       num_heads=4, dim_head=8)
-    params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, ND)), jnp.zeros((1, 1)))
-    score_fn = lambda x_flat, t_col: model.apply(params, x_flat, t_col)
-
-    # Use a small set of noised frames
     B = 8
     rng = np.random.default_rng(1)
     idx = rng.integers(0, len(x0), B)
-    x_t  = jnp.array(x0[idx])         # (B, n, d) — use x0 as x_t (t≈0 approximation)
-    t    = 0.3 * jnp.ones(B)
-
-    # Trivial s_true = zeros (loss just tests finite propagation)
+    x_t    = jnp.array(x0[idx])
+    t      = 0.3 * jnp.ones(B)
     s_true = jnp.zeros_like(x_t)
 
-    loss = riemannian_dsm_loss_from_noised(
-        score_fn=score_fn,
-        manifold=manifold,
-        sde=sde,
-        x_t=x_t,
-        s_true=s_true,
-        t=t,
-        likelihood_weighting=False,
-        normalize_targets=False,
-    )
-    loss_val = float(loss)
-    ok = np.isfinite(loss_val)
-    status = "PASS" if ok else "FAIL"
-    print(f"  {'✓' if ok else '✗'} loss finite: loss={loss_val:.4f}  {status}")
-    return ok
+    all_ok = True
+    for conservative in [False, True]:
+        model = GraphTransformerScoreModel(n=N_ATOMS, d=D, hidden_dim=32, num_layers=1,
+                                           num_heads=4, dim_head=8,
+                                           conservative=conservative)
+        params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, ND)), jnp.zeros((1, 1)))
+        score_fn = lambda x_flat, t_col: model.apply(params, x_flat, t_col)
+
+        loss = riemannian_dsm_loss_from_noised(
+            score_fn=score_fn, manifold=manifold, sde=sde,
+            x_t=x_t, s_true=s_true, t=t,
+            likelihood_weighting=False, normalize_targets=False,
+        )
+        loss_val = float(loss)
+        ok = np.isfinite(loss_val)
+        all_ok = all_ok and ok
+        print(f"  {'✓' if ok else '✗'} loss finite conservative={conservative}: "
+              f"loss={loss_val:.4f}  {'PASS' if ok else 'FAIL'}")
+
+    return all_ok
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Loss decreases over 200 epochs
+# Test 3: Loss decreases over 200 epochs (non-conservative — fast)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.slow
 def test_loss_decreases():
-    """Train 200 epochs on 64 synthetic BBA frames — loss must decrease."""
+    """Train 200 epochs on 64 synthetic BBA frames (non-conservative) — loss must decrease."""
     x0 = make_synthetic_bba(N=64, seed=42)
     manifold, sde = make_manifold_and_sde(x0)
 
+    # Non-conservative: fast, ~0.3ms/step
     model = GraphTransformerScoreModel(n=N_ATOMS, d=D, hidden_dim=32, num_layers=1,
-                                       num_heads=4, dim_head=8)
+                                       num_heads=4, dim_head=8, conservative=False)
     params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, ND)), jnp.zeros((1, 1)))
 
     # Use precomputed-style batch: x_t ≈ x0, s_true = zeros, t=0.3
@@ -212,27 +212,65 @@ def test_loss_decreases():
 
 
 # ---------------------------------------------------------------------------
+# Test 4: Conservative and non-conservative modes produce different outputs
+# ---------------------------------------------------------------------------
+
+def test_modes_differ():
+    """Conservative and non-conservative modes must produce different outputs at init."""
+    B = 4
+    x_flat = jnp.ones((B, ND))
+    t_col  = 0.5 * jnp.ones((B, 1))
+    rng    = jax.random.PRNGKey(0)
+
+    model_nc = GraphTransformerScoreModel(n=N_ATOMS, d=D, hidden_dim=32, num_layers=1,
+                                          num_heads=4, dim_head=8, conservative=False)
+    model_c  = GraphTransformerScoreModel(n=N_ATOMS, d=D, hidden_dim=32, num_layers=1,
+                                          num_heads=4, dim_head=8, conservative=True)
+
+    params_nc = model_nc.init(rng, x_flat, t_col)
+    params_c  = model_c.init(rng, x_flat, t_col)
+
+    out_nc = model_nc.apply(params_nc, x_flat, t_col)
+    out_c  = model_c.apply(params_c,  x_flat, t_col)
+
+    # Both finite
+    assert bool(jnp.all(jnp.isfinite(out_nc))), "non-conservative: non-finite output"
+    assert bool(jnp.all(jnp.isfinite(out_c))),  "conservative: non-finite output"
+
+    # Outputs differ (different parameterization → different function at init)
+    max_diff = float(jnp.abs(out_nc - out_c).max())
+    ok = max_diff > 1e-6
+    print(f"  {'✓' if ok else '✗'} modes differ: max_diff={max_diff:.4f}  {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # Standalone runner
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("TEST 1: Forward pass")
+    print("TEST 1: Forward pass (both modes)")
     print("=" * 60)
     r1 = test_forward_pass()
 
     print("\n" + "=" * 60)
-    print("TEST 2: Loss finite")
+    print("TEST 2: Loss finite (both modes)")
     print("=" * 60)
     r2 = test_loss_finite()
 
     print("\n" + "=" * 60)
-    print("TEST 3: Loss decreases (200 epochs)")
+    print("TEST 3: Loss decreases 200 epochs (non-conservative)")
     print("=" * 60)
     r3 = test_loss_decreases()
 
-    passed = sum([r1, r2, r3])
+    print("\n" + "=" * 60)
+    print("TEST 4: Conservative ≠ non-conservative")
+    print("=" * 60)
+    r4 = test_modes_differ()
+
+    passed = sum([r1, r2, r3, r4])
     print(f"\n{'='*60}")
-    print(f"Results: {passed}/3 passed")
-    if passed < 3:
+    print(f"Results: {passed}/4 passed")
+    if passed < 4:
         sys.exit(1)

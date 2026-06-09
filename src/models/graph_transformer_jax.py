@@ -8,16 +8,25 @@ two-for-one-diffusion implementation.
 Key design choices vs. the ScoreMD original:
   - Standalone Flax module — no scoremd imports (no BaseDiffusionModel, Dataset, EnergyModel)
   - Interface matches TangentScoreModel: (x_flat: (B,nd), t: (B,1)) → (B,nd)
-  - Conservative (energy) parameterization only: score = -∇_x E_θ(x,t)
-    Same pattern as PotentialTangentScoreModel in tangent_mlp.py
+  - Two output modes controlled by `conservative` flag:
+      conservative=True  — score = -∇_x E_θ(x,t)  (energy-based, nested autodiff)
+      conservative=False — score = f_θ(x,t) directly  (non-conservative, ~1000× faster)
+    See benchmark note below.
   - No dropout, no `training` flag — deterministic JIT-friendly
   - Edge features: pairwise differences x_i - x_j (shape B×n×n×d)
     Provides translation-invariant structural inductive bias the MLP lacks
-  - Node init: sinusoidal time embedding only (no atom type embeddings —
-    BBA has only Cα, all identical type)
+  - Node init: one-hot atom identity (n×n) + sinusoidal time embedding (4)
+    One-hot is critical — without it atoms are indistinguishable and cos_sim ≈ 0.27
+
+Speed note (BBA, n=28, d=3, batch=64, CPU):
+  conservative=True  — 354 ms/step  (grad_params(loss(grad_x(E))), nested autodiff)
+  conservative=False —   ~0.3 ms/step  (single forward pass + grad_params(loss))
+  Use conservative=False for training; conservative=True only if an energy landscape
+  is needed at inference (e.g. Langevin dynamics with E as potential).
 
 Usage:
-    model = GraphTransformerScoreModel(n=28, d=3)
+    model = GraphTransformerScoreModel(n=28, d=3)                    # non-conservative
+    model = GraphTransformerScoreModel(n=28, d=3, conservative=True) # conservative
     params = model.init(rng, jnp.zeros((B, 84)), jnp.zeros((B, 1)))
     score_fn = lambda x_flat, t: model.apply(params, x_flat, t)
     # score_fn is compatible with riemannian_dsm_loss_from_noised
@@ -165,41 +174,93 @@ class GraphTransformerLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Shared backbone: node + edge embedding + GT layers
+# ---------------------------------------------------------------------------
+
+def _gt_backbone(
+    module: nn.Module,
+    x_flat: jnp.ndarray,
+    t: jnp.ndarray,
+) -> jnp.ndarray:
+    """
+    Shared GT backbone: embed → attend → return node features.
+
+    :param module:  the GraphTransformerScoreModel instance (provides hyperparams + Dense layers)
+    :param x_flat:  (B, n*d)
+    :param t:       (B, 1)
+    :return:        (B, n, hidden_dim) final node embeddings
+    """
+    B = x_flat.shape[0]
+    x = (x_flat / module.input_scale).reshape(B, module.n, module.d)  # (B, n, d)
+
+    # Edge features: pairwise differences x_i - x_j → (B, n, n, d)
+    xa = x[:, :, None, :]   # (B, n, 1, d)
+    xb = x[:, None, :, :]   # (B, 1, n, d)
+    edge_diff = xa - xb     # (B, n, n, d) — translation-invariant relative geometry
+    edges = nn.Dense(module.hidden_dim, name="edge_embedding")(edge_diff)  # (B, n, n, hidden_dim)
+
+    # Node init: one-hot atom identity (n×n) + sinusoidal time embedding (4)
+    # One-hot is critical: gives each atom a unique positional embedding.
+    # Without it atoms are indistinguishable → cos_sim ≈ 0.27.
+    one_hot = jnp.tile(jnp.eye(module.n)[None], (B, 1, 1))      # (B, n, n)
+    t_emb = sinusoidal_time_embed(t)                             # (B, 4)
+    t_nodes = jnp.tile(t_emb[:, None, :], (1, module.n, 1))     # (B, n, 4)
+    node_feats = jnp.concatenate([one_hot, t_nodes], axis=-1)   # (B, n, n+4)
+    nodes = nn.Dense(module.hidden_dim, name="node_embedding")(node_feats)  # (B, n, hidden_dim)
+
+    # All-nodes mask (no masking for BBA — all atoms present)
+    mask = jnp.ones((B, module.n), dtype=bool)
+
+    # Graph transformer layers
+    for i in range(module.num_layers):
+        nodes = GraphTransformerLayer(
+            heads=module.num_heads,
+            dim_head=module.dim_head,
+            ff_mult=module.ff_mult,
+            name=f"gt_layer_{i}",
+        )(nodes, edges, mask=mask)
+
+    return nodes  # (B, n, hidden_dim)
+
+
+# ---------------------------------------------------------------------------
 # Main model: GraphTransformerScoreModel
 # ---------------------------------------------------------------------------
 
 class GraphTransformerScoreModel(nn.Module):
     """
-    Conservative graph transformer score model for Riemannian DSM.
+    Graph transformer score model for Riemannian DSM on protein shape manifolds.
 
-    Architecture:
+    Shared backbone (steps 1–4):
       1. Reshape x_flat (B, n*d) → x (B, n, d)
       2. Edge attributes: x_i - x_j → (B, n, n, d) → project to (B, n, n, hidden_dim)
       3. Node init: [one_hot(n×n) | t_emb(4)] → project to (B, n, hidden_dim)
-      4. num_layers GraphTransformerLayer blocks
-      5. Energy per node: Dense(1) → (B, n, 1)
-      6. Score = -∇_{x_flat} Σ_b Σ_i E_θ(x_b, i, t_b)
+      4. num_layers GraphTransformerLayer blocks → (B, n, hidden_dim)
 
-    Interface matches TangentScoreModel and PotentialTangentScoreModel:
-      __call__(x_flat: (B, n*d), t: (B, 1)) → (B, n*d)
+    Output head (step 5), controlled by `conservative`:
+      conservative=False (default, recommended for training):
+        Dense(d) on each node → (B, n, d) → reshape (B, n*d)
+        Single forward pass; grad_params is first-order only. ~0.3 ms/step.
+
+      conservative=True (energy-based, for inference/Langevin):
+        Dense(1) on each node → scalar energy E_θ
+        score = -grad_x E_θ(x, t)
+        Nested autodiff at training time: grad_params(loss(grad_x(E))). ~354 ms/step.
+        Use only when the energy landscape E_θ is needed explicitly.
 
     Default hyperparameters match ScoreMD's BBA "large_potential" config:
-      hidden_dim=128, num_layers=3, num_heads=8, dim_head=64
-      → ~1.5M parameters (same order as ScoreMD BBA baseline)
+      hidden_dim=128, num_layers=3, num_heads=8, dim_head=64 → ~1.4M params
 
-    Node features = one-hot atom identity (n×n) concatenated with sinusoidal
-    time embedding (4), matching ScoreMD's features=None path (identity matrix).
-    This gives each atom a unique positional embedding — critical for memorization
-    and generalization on ordered sequences like protein backbones.
-
-    :param n:          Number of atoms (default 28 for BBA)
-    :param d:          Spatial dimension (default 3)
-    :param hidden_dim: Node/edge feature dimension
-    :param num_layers: Number of graph transformer layers
-    :param num_heads:  Number of attention heads per layer
-    :param dim_head:   Dimension per head (attention inner dim = num_heads * dim_head)
-    :param ff_mult:    Feedforward multiplier in each layer
-    :param input_scale: Divide x_flat by this before processing (numerical stability)
+    :param n:            Number of atoms (default 28 for BBA)
+    :param d:            Spatial dimension (default 3)
+    :param hidden_dim:   Node/edge feature dimension
+    :param num_layers:   Number of graph transformer layers
+    :param num_heads:    Number of attention heads per layer
+    :param dim_head:     Dimension per head
+    :param ff_mult:      Feedforward multiplier in each layer
+    :param input_scale:  Divide x_flat by this before processing (numerical stability)
+    :param conservative: If True, use energy-based output (score = -grad_x E).
+                         If False (default), output score directly from node embeddings.
     """
     n: int = 28
     d: int = 3
@@ -209,61 +270,26 @@ class GraphTransformerScoreModel(nn.Module):
     dim_head: int = 64
     ff_mult: int = 4
     input_scale: float = 6.26
+    conservative: bool = False
 
     @nn.compact
-    def _energy(self, x_flat: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute per-node energy E_θ(x, t).
-
-        :param x_flat: (B, n*d)
-        :param t:      (B, 1)
-        :return:       (B, n, 1) per-node energy
-        """
-        B = x_flat.shape[0]
-        x = (x_flat / self.input_scale).reshape(B, self.n, self.d)  # (B, n, d)
-
-        # Edge features: pairwise differences x_i - x_j → (B, n, n, d)
-        xa = x[:, :, None, :]   # (B, n, 1, d)
-        xb = x[:, None, :, :]   # (B, 1, n, d)
-        edge_diff = xa - xb     # (B, n, n, d) — translation-invariant relative geometry
-        edges = nn.Dense(self.hidden_dim, name="edge_embedding")(edge_diff)  # (B, n, n, hidden_dim)
-
-        # Node init: one-hot atom identity (n×n) + sinusoidal time embedding (4)
-        # Matches ScoreMD's features=None path: identity matrix gives each atom
-        # a unique positional embedding — critical for memorization on ordered sequences.
-        one_hot = jnp.tile(jnp.eye(self.n)[None], (B, 1, 1))      # (B, n, n)
-        t_emb = sinusoidal_time_embed(t)                           # (B, 4)
-        t_nodes = jnp.tile(t_emb[:, None, :], (1, self.n, 1))     # (B, n, 4)
-        node_feats = jnp.concatenate([one_hot, t_nodes], axis=-1)  # (B, n, n+4)
-        nodes = nn.Dense(self.hidden_dim, name="node_embedding")(node_feats)  # (B, n, hidden_dim)
-
-        # All-nodes mask (no masking for BBA — all atoms present)
-        mask = jnp.ones((B, self.n), dtype=bool)
-
-        # Graph transformer layers
-        for i in range(self.num_layers):
-            nodes = GraphTransformerLayer(
-                heads=self.num_heads,
-                dim_head=self.dim_head,
-                ff_mult=self.ff_mult,
-                name=f"gt_layer_{i}",
-            )(nodes, edges, mask=mask)
-
-        # Per-node energy: (B, n, 1)
-        return nn.Dense(1, name="node_decoder")(nodes)
-
     def __call__(self, x_flat: jnp.ndarray, t: jnp.ndarray) -> jnp.ndarray:
         """
-        Compute score = -∇_{x_flat} E_θ(x, t).
-
         :param x_flat: (B, n*d) flattened conformation (centred, in Ångström)
         :param t:      (B, 1) or (B,) diffusion time in [0, 1]
         :return:       (B, n*d) score estimate
         """
-        t = t.reshape(-1, 1)   # ensure (B, 1)
+        t = t.reshape(-1, 1)  # ensure (B, 1)
 
-        def energy_sum(x_flat: jnp.ndarray) -> jnp.ndarray:
-            # Sum over batch and nodes to get a scalar for jax.grad
-            return self._energy(x_flat, t).sum()
-
-        return -jax.grad(energy_sum)(x_flat)
+        if self.conservative:
+            # Energy-based: score = -grad_x Σ E_θ(x_i, t)
+            # NOTE: nested autodiff at train time — use only when energy is needed at inference.
+            def energy_sum(x_flat_: jnp.ndarray) -> jnp.ndarray:
+                nodes = _gt_backbone(self, x_flat_, t)
+                return nn.Dense(1, name="node_decoder")(nodes).sum()
+            return -jax.grad(energy_sum)(x_flat)
+        else:
+            # Direct score output: no grad_x, first-order training only.
+            nodes = _gt_backbone(self, x_flat, t)            # (B, n, hidden_dim)
+            score = nn.Dense(self.d, name="node_decoder")(nodes)  # (B, n, d)
+            return score.reshape(x_flat.shape[0], self.n * self.d)
