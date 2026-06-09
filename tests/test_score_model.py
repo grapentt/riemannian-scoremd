@@ -9,6 +9,7 @@ Gates:
 
 Usage:
     pytest tests/test_score_model.py -v
+    pytest tests/test_score_model.py -v --runslow   # include slow tests
     python tests/test_score_model.py           # verbose standalone run
 """
 
@@ -16,6 +17,7 @@ import sys
 import numpy as np
 import jax
 import jax.numpy as jnp
+import pytest
 from pathlib import Path
 
 _ROOT = Path(__file__).parent.parent
@@ -123,6 +125,7 @@ def test_loss_finite():
 # Test 3: Loss decreases over 200 epochs (synthetic data)
 # ---------------------------------------------------------------------------
 
+@pytest.mark.slow
 def test_loss_decreases():
     """
     Train for 200 epochs on chignolin data (or 200 synthetic frames as fallback).
@@ -202,6 +205,7 @@ def test_score_forward():
 def test_score_loss_finite():
     assert test_loss_finite()
 
+@pytest.mark.slow
 def test_score_loss_decreases():
     assert test_loss_decreases()
 

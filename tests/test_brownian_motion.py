@@ -247,21 +247,21 @@ def test_diffusion_coefficient_recovery(n_trajectories: int = 20, n_steps: int =
 # Test 5: Score target round-trip (explicit test of the 0.5× convention)
 # ---------------------------------------------------------------------------
 
-def test_score_target_round_trip(tol_cos: float = 0.85, tol_mag: float = 0.20):
+def test_score_target_round_trip(tol_cos: float = 0.65):
     """
-    Verify that score_target recovers the injected noise direction and magnitude.
+    Verify that score_target recovers the injected noise direction.
 
-    Convention: marginal_prob passes 0.5*alpha*sigma*v_h_unit to s_exp (compensating
-    for geodesic doubling). The score target should satisfy:
+    After the score_target fix (project_G(-prelog)/sigma²), the target is the
+    Euclidean flat gradient of w² projected to the horizontal space. It no longer
+    satisfies ||s_true||_g = alpha/sigma (that was only true for the H-inverse path),
+    but it must point in the correct direction:
 
-        s_true = -s_log(x_t, x_0) / sigma(t)^2
+        cos(s_true, v_h_unit)  >  tol_cos   (direction recovery)
+        leakage = ||s_true - project_G(s_true)|| / ||s_true||  <  1e-5  (exact horizontality)
 
-    with ||s_true||_g ≈ alpha(t) / sigma(t)  and  direction ≈ v_h_unit.
+    Tests across t ∈ {0.2, 0.5, 0.8}.
 
-    Tests across t ∈ {0.2, 0.5, 0.8} to cover low, mid, and high noise levels.
-
-    Tolerances are generous in fast mode (n=10 synthetic) because s_prelog accuracy
-    degrades on small irregular proteins. Full AK (n=214) gives cos > 0.999, rel < 5%.
+    Tolerances are generous in fast mode (n=10 synthetic). Full AK gives cos > 0.999.
     """
     x0 = load_ak_frame(0)
     manifold, sde = make_manifold_and_sde(x0)
@@ -275,25 +275,22 @@ def test_score_target_round_trip(tol_cos: float = 0.85, tol_mag: float = 0.20):
         score = sde.score_target(x_t, x0, t)          # (N, 1, 1, n, d)
         score_nd = score[:, :, 0]                      # (N, 1, n, d)
 
-        # Direction: cosine similarity between score and injected v_h_unit
+        # Direction: cosine similarity between score and injected v_h_unit (Euclidean)
         s_flat = score_nd[0, 0].flatten()
         v_flat = v_h_unit[0, 0, 0].flatten()
         cos = float(jnp.dot(s_flat, v_flat) /
                     (jnp.linalg.norm(s_flat) * jnp.linalg.norm(v_flat) + 1e-12))
 
-        # Magnitude: ||score||_g should ≈ alpha(t) / sigma(t)
-        alpha_t = float(sde.alpha(t))
-        s_t = float(sigma_t)
-        expected_mag = alpha_t / s_t
-        actual_mag = float(manifold.norm(x_t, score[:, :, :1])[0, 0, 0])
-        rel_mag_err = abs(actual_mag - expected_mag) / (expected_mag + 1e-8)
+        # Leakage: score must be exactly horizontal (project_G-invariant)
+        score_proj = manifold.horizontal_projection_tvector(x_t, score[:, :, :1])[:, :, 0]
+        leak = float(jnp.linalg.norm(score_nd - score_proj) /
+                     (jnp.linalg.norm(score_nd) + 1e-12))
 
-        ok = cos > tol_cos and rel_mag_err < tol_mag
+        ok = cos > tol_cos and leak < 1e-5
         all_pass = all_pass and ok
         status = "OK" if ok else "FAIL"
         print(f"  t={t_val:.1f}:  cos(score, v_h)={cos:.4f}  "
-              f"||score||_g={actual_mag:.4f}  expected={expected_mag:.4f}  "
-              f"rel_err={rel_mag_err:.3f}  {status}")
+              f"leakage={leak:.2e}  {status}")
 
     status = "PASS" if all_pass else "FAIL"
     print(f"  {'✓' if all_pass else '✗'} score target round-trip  {status}")

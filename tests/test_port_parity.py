@@ -46,7 +46,10 @@ def make_torch_inputs():
     rng = np.random.default_rng(seed=SEED)
     x_np = rng.standard_normal((N, M, n, d)).astype(np.float32)
     y_np = rng.standard_normal((N, MM, n, d)).astype(np.float32)
-    return torch.tensor(x_np), torch.tensor(y_np)
+    # torch.from_numpy / torch.tensor both fail with NumPy 2.x (bridge broken);
+    # construct via Python list to bypass the C-level numpy bridge entirely.
+    return (torch.tensor(x_np.tolist(), dtype=torch.float32),
+            torch.tensor(y_np.tolist(), dtype=torch.float32))
 
 
 def make_jax_inputs():
@@ -58,7 +61,9 @@ def make_jax_inputs():
 
 def max_diff(jax_out, torch_out):
     j = np.asarray(jax_out, dtype=np.float32)
-    t = torch_out.detach().numpy().astype(np.float32)
+    # torch.Tensor.numpy() fails with NumPy 2.x (C-level bridge broken).
+    # Go through .tolist() → Python scalars → numpy, which is always safe.
+    t = np.array(torch_out.detach().tolist(), dtype=np.float32)
     assert j.shape == t.shape, f"Shape mismatch: JAX {j.shape} vs ref {t.shape}"
     return float(np.max(np.abs(j - t)))
 
@@ -138,7 +143,7 @@ def run_all():
 
     base_np = np.random.default_rng(99).standard_normal((n, d)).astype(np.float32)
     base_j = jnp.array(base_np)
-    base_t = torch.tensor(base_np)
+    base_t = torch.tensor(base_np.tolist(), dtype=torch.float32)
     check("least_orthogonal",
           lambda: pc.least_orthogonal(pc.center_mpoint(xj), base=base_j),
           lambda: pc_ref.least_orthogonal(pc_ref.center_mpoint(xt), base=base_t))

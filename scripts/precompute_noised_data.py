@@ -50,12 +50,19 @@ PROTEINS = {
 
 
 def precompute_repeat(
-    manifold, sde, train_data, t_min, t_max, rng, repeat_idx, out_path, B=128
+    manifold, sde, train_data, t_min, t_max, rng, repeat_idx, out_path,
+    use_slog: bool = True, B=128
 ):
     """
     Compute (x_t, s_true, t) for all frames in train_data.
     Processes in batches of B to show progress.
     Saves to out_path as a compressed .npz file.
+
+    use_slog=True (default): score_target uses s_log (Riemannian gradient, O((nd)³)).
+        Geometrically principled — cost is paid once here, amortized across all training
+        steps.  This is the recommended mode for BBA/AK precomputed data generation.
+    use_slog=False: score_target uses prelog+project_G (flat gradient, O(n²d)).
+        Fast fallback for smoke tests only; ~35° angular difference from s_log.
     """
     N, n, d = train_data.shape
     rng, t_key = jax.random.split(rng)
@@ -75,11 +82,34 @@ def precompute_repeat(
 
         rng, noise_key = jax.random.split(rng)
         x_t_batch, s_true_batch = prepare_batch(
-            manifold, sde, x0_batch, t_batch, noise_key
+            manifold, sde, x0_batch, t_batch, noise_key, use_slog=use_slog
         )
 
         x_t_all[start:end] = np.array(x_t_batch)
         s_true_all[start:end] = np.array(s_true_batch)
+
+        # Retry any NaN frames individually (s_exp can diverge on rare frames
+        # at large t; retrying with a fresh noise key almost always succeeds).
+        nan_mask = np.isnan(x_t_all[start:end]).any(axis=(-2, -1))
+        if nan_mask.any():
+            nan_idxs = np.where(nan_mask)[0]
+            for local_i in nan_idxs:
+                global_i = start + local_i
+                for attempt in range(10):
+                    rng, retry_key = jax.random.split(rng)
+                    x_t_r, s_true_r = prepare_batch(
+                        manifold, sde,
+                        jnp.array(train_data[global_i:global_i+1]),
+                        t_all[global_i:global_i+1],
+                        retry_key, use_slog=use_slog
+                    )
+                    if not np.isnan(np.array(x_t_r)).any():
+                        x_t_all[global_i] = np.array(x_t_r[0])
+                        s_true_all[global_i] = np.array(s_true_r[0])
+                        print(f"\n  retried frame {global_i} (attempt {attempt+1}): OK")
+                        break
+                else:
+                    print(f"\n  WARNING: frame {global_i} still NaN after 10 retries — skipping")
 
         if (b + 1) % 20 == 0 or b == n_batches - 1:
             elapsed = time.time() - t0
@@ -115,6 +145,10 @@ def main():
                         help="Batch size for prepare_batch calls (affects only progress reporting)")
     parser.add_argument("--start-repeat", type=int, default=0,
                         help="Resume from this repeat index (0-based)")
+    parser.add_argument("--use-prelog", action="store_true", default=False,
+                        help="Use prelog+project_G score targets instead of s_log. "
+                             "Faster (O(n²d) vs O((nd)³)) but 46° off the Riemannian "
+                             "gradient. Default: s_log (geometrically principled).")
     args = parser.parse_args()
 
     out_dir = Path(args.output) / args.protein
@@ -133,6 +167,8 @@ def main():
     info = PROTEINS[args.protein]
     manifold = ShapeManifold(dim=d, numpoints=n, alpha=1.0, base=x_ref)
     sde = ManifoldVP(manifold)
+    use_slog = not args.use_prelog
+    print(f"Score target: {'s_log (Riemannian gradient, O((nd)^3), default)' if use_slog else 'prelog+project_G (flat gradient, O(n^2 d), --use-prelog)'}\n")
 
     # ---- Warm up s_exp JIT ----
     print("Warming up s_exp JIT cache...")
@@ -165,7 +201,7 @@ def main():
         rng = precompute_repeat(
             manifold, sde, train_data,
             args.t_min, args.t_max, rng, r,
-            out_path, B=args.batch_size
+            out_path, use_slog=use_slog, B=args.batch_size
         )
 
     print(f"\nDone. All {args.n_repeats} repeats saved to {out_dir}/")

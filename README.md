@@ -106,17 +106,22 @@ Data & runs (git-ignored):
 |---|---|---|
 | 0–2.5 | JAX port + manifold forward process + s_exp optimisation (2.6 ms) | **Complete** (21/21 geometry tests) |
 | 2.6 | Data acquisition (DE Shaw chignolin + BBA) + pipeline validation | **Complete** |
-| 3 | Tangent-space score network + Riemannian DSM loss | **Code complete**; 3000-epoch BBA training run executed using buggy targets (see `runs/bba_phase36/` + README caveat + THEORY.md §12) |
+| 3 | Tangent-space score network + Riemannian DSM loss | **Code complete**; first clean training run in progress (see below) |
 | 4 | Manifold Fokker–Planck loss (full Laplace–Beltrami derivation) | **Blocked** — requires analytic derivation from Kolmogorov forward equation |
 | 5–6 | End-to-end sampling, baselines (vs ScoreMD on BBA, Xu 2026 on AK), scaling, arXiv | Not started |
 
-**Latest experiment (with important caveat)**: `runs/bba_phase36/` — 256^4 non-conservative `TangentScoreModel` trained 3000 epochs on 63k BBA frames using precomputed targets generated with the old `s_log` (H-eig cut). On real data at α=1.0 this produced inconsistent targets due to the H-vs-G vertical space mismatch. Loss ~105 but cosine similarity to correct targets ≈ 0. The fix (prelog + explicit `project_G`) was implemented afterwards. See the **unified** `THEORY.md` §12 (now the single authoritative source, with all evidence and resolution paths) + `APPROXIMATIONS.md` for the full story. A clean re-train on corrected targets is required before interpreting results.
+**Current training run** (started 2026-06-01): `TangentScoreModel` (256^4), 3000 epochs on 62,901 clean BBA frames × 10 precomputed repeats, `eps_parameterization=True` loss. First 100 epochs verified locally: loss 8.30 → 7.98, monotonically decreasing, no collapse. Full run on Colab GPU in progress. See `CURRENT_STATE.md` for full status.
+
+**History of failed runs and root-cause analyses**:
+- *Phase 3.6 run* (`runs/bba_phase36/`): 3000 epochs, loss ~105, cosine sim ≈ 0. Root cause: `metric_tensor` transpose bug → H-eig cut leaked vertical components → inconsistent precomputed targets.
+- *Phase 3.7 run* (post-bugfix, standard DSM loss with `likelihood_weighting=True`): collapsed to zero-output basin at epoch 50, loss frozen at 53.44 for 3000 epochs. Root cause: init scale 1.78 trapped between opposing gradients from small-t (push up) and large-t (push down) regimes. See `TRAINING_COLLAPSE_ANALYSIS.md` for full empirical diagnosis.
 
 ### Known implementation subtleties (read before modifying loss or projection code)
-- On real folded protein data with α=1.0 the metric tensor H is **indefinite** (4–5 small negative eigenvalues). The bottom-(nd-6) eigenvectors of H do **not** coincide with the true 6-dimensional vertical space of rigid motions. The explicit G-basis `horizontal_projection_tvector` (used throughout training and `score_target`) is the correct projector; the old H-eig cut inside `s_log` leaks vertical components.
-- Riemannian (g-norm) DSM loss is numerically unstable (cond(H) ~ 10^7–10^8). Current production path uses Euclidean norm on the horizontally-projected residual (identical fixed point).
-- `s_exp` / `s_log` are **not vmappable** (Python-level `K = int(...)`). Two supported training paths exist: (1) precompute noised data once then `train_from_precomputed`, (2) `prepare_batch_vmapped` with `fixed_K=1` (valid for BBA/chignolin).
-- See the **unified** `THEORY.md` (especially §12 on the H-vs-G mismatch, now the single source of truth with all evidence integrated) and `APPROXIMATIONS.md` for the complete picture. The previously scattered diagnostic documents (`H_REPAIR.md`, `bug_diagnostic.md`, etc.) have been superseded.
+- **Loss parameterization**: use `eps_parameterization=True` in `riemannian_dsm_loss_from_noised`. The raw score target $s_{\text{true}} = \alpha(t)/\sigma(t) \cdot v_{h,\text{unit}}$ has a 207× amplitude variation across $t$ that causes gradient cancellation at init. The ε-parameterization predicts $v_{h,\text{unit}}$ directly (constant Euclidean norm ≈ 2.81, measured on 188k BBA frames). See `TRAINING_COLLAPSE_ANALYSIS.md`.
+- On real folded protein data with α=1.0 the metric tensor H is **indefinite** (4–5 small negative eigenvalues). The explicit G-basis `horizontal_projection_tvector` (used throughout training) is the correct projector; the old H-eig cut inside `s_log` leaks vertical components.
+- Riemannian (g-norm) DSM loss is numerically unstable (cond(H) ~ 10^7–10^8). Production path uses Euclidean norm on the horizontally-projected residual.
+- `s_exp` / `s_log` are **not vmappable** (Python-level `K = int(...)`). Two supported training paths: (1) precompute noised data once then `train_from_precomputed`, (2) `prepare_batch_vmapped` with `fixed_K=1`.
+- See `THEORY.md` (§12 on the H-vs-G mismatch), `APPROXIMATIONS.md`, and `TRAINING_COLLAPSE_ANALYSIS.md`.
 
 ---
 

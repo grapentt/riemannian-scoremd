@@ -571,45 +571,53 @@ def train_from_precomputed(
                                  normalize_targets=normalize_targets,
                                  eps_parameterization=eps_parameterization)
 
+    # ---- Preload all repeats into RAM (eliminates per-epoch npz decompression) ----
+    print(f"  Preloading {len(repeat_files)} repeat files into RAM...")
+    t_load = time.time()
+    preloaded = []
+    for rf in repeat_files:
+        data = np.load(rf)
+        x_t_np    = data["x_t"].astype(np.float32)
+        s_true_np = data["s_true"].astype(np.float32)
+        t_np      = data["t"].astype(np.float32)
+        # Drop NaN frames
+        valid = ~(np.isnan(x_t_np).any(axis=(-2, -1)) |
+                  np.isnan(s_true_np).any(axis=(-2, -1)))
+        if not valid.all():
+            x_t_np, s_true_np, t_np = x_t_np[valid], s_true_np[valid], t_np[valid]
+        # Clip extreme s_true outliers
+        norms = np.sqrt((s_true_np ** 2).sum(axis=(-2, -1), keepdims=True))
+        s_true_np = s_true_np * np.minimum(1.0, _SCORE_NORM_CLIP / (norms + 1e-8))
+        # Transfer to device once — eliminates per-epoch host→device copy (~21 MB/array)
+        preloaded.append((jnp.array(x_t_np), jnp.array(s_true_np), jnp.array(t_np)))
+    ram_gb = sum(x.nbytes + s.nbytes + t.nbytes for x, s, t in preloaded) / 1e9
+    print(f"  Preload done in {time.time()-t_load:.1f}s  ({ram_gb:.2f} GB on device)")
+
     loss_history = []
     t0_wall = time.time()
     n_repeats = len(repeat_files)
 
-    _running_loss_sum = 0.0
+    # Accumulate loss on device; only call float() at log_every boundary to avoid
+    # a GPU→CPU sync barrier on every step (see KNOWN_ISSUES.md §1).
+    _running_loss_sum = jnp.zeros(())
     _running_loss_steps = 0
 
     pbar = tqdm(range(n_epochs), desc="training", unit="epoch")
     for epoch in pbar:
         rng, shuffle_key = jax.random.split(rng)
-        repeat_file = repeat_files[epoch % n_repeats]
+        repeat_idx = epoch % n_repeats
+        repeat_file = repeat_files[repeat_idx]
 
-        # Load this repeat's data
-        data = np.load(repeat_file)
-        x_t_np    = data["x_t"].astype(np.float32)    # (N, n, d)
-        s_true_np = data["s_true"].astype(np.float32)  # (N, n, d)
-        t_np      = data["t"].astype(np.float32)       # (N,)
+        x_t_np, s_true_np, t_np = preloaded[repeat_idx]
 
-        # Drop NaN frames (rare: ~3 per 630k across all BBA repeats)
-        valid = ~(np.isnan(x_t_np).any(axis=(-2, -1)) |
-                  np.isnan(s_true_np).any(axis=(-2, -1)))
-        if not valid.all():
-            x_t_np, s_true_np, t_np = x_t_np[valid], s_true_np[valid], t_np[valid]
-
-        # Clip extreme s_true outliers by per-sample norm (prevents gradient explosion)
-        norms = np.sqrt((s_true_np ** 2).sum(axis=(-2, -1), keepdims=True))  # (N,1,1)
-        scale = np.minimum(1.0, _SCORE_NORM_CLIP / (norms + 1e-8))
-        s_true_np = s_true_np * scale
-
-        x_t_all    = jnp.array(x_t_np)
-        s_true_all = jnp.array(s_true_np)
-        t_all      = jnp.array(t_np)
-        N_valid    = x_t_all.shape[0]
+        # Data is already on device — just index and shuffle
+        N_valid = x_t_np.shape[0]
 
         # Shuffle
         idx = jax.random.permutation(shuffle_key, N_valid)
-        x_t_all    = x_t_all[idx]
-        s_true_all = s_true_all[idx]
-        t_all      = t_all[idx]
+        x_t_all    = x_t_np[idx]
+        s_true_all = s_true_np[idx]
+        t_all      = t_np[idx]
 
         n_steps = max(1, N_valid // batch_size)
         for step in range(n_steps):
@@ -621,13 +629,12 @@ def train_from_precomputed(
             params, ema_params, opt_state, loss = train_step(
                 params, ema_params, opt_state, x_t_b, s_true_b, t_b
             )
-            step_loss = float(loss)
-            _running_loss_sum += step_loss
+            _running_loss_sum = _running_loss_sum + loss   # stays on device
             _running_loss_steps += 1
 
         if (epoch + 1) % log_every == 0 or epoch == 0:
-            smoothed_loss = _running_loss_sum / max(1, _running_loss_steps)
-            _running_loss_sum = 0.0
+            smoothed_loss = float(_running_loss_sum) / max(1, _running_loss_steps)
+            _running_loss_sum = jnp.zeros(())
             _running_loss_steps = 0
             elapsed = time.time() - t0_wall
             loss_history.append((epoch + 1, smoothed_loss))
