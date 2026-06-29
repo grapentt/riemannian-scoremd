@@ -2,8 +2,8 @@
 
 **This is the single source of truth for all mathematical, geometric, and implementation-theory content in the project.**
 
-**Version:** 3.0 (2026-05-28 — transpose bug fix applied; §12 rewritten as root-cause analysis; §13 updated)  
-**Previous versions:** v1.3 (2026-05-26) — see git history for the pre-unification state.
+**Version:** 3.1 (2026-06-29 — §13 expanded into a full Phase 4 Riemannian FP DRAFT awaiting user sign-off; §12 unchanged from v3.0)  
+**Previous versions:** v3.0 (2026-05-28, transpose bug fix); v1.3 (2026-05-26) — see git history.
 
 **Unification notice**: This document now incorporates unique analytical content previously scattered across `theory_and_architecture.md`, `problem.md`, `bug_diagnostic.md`, `H_REPAIR.md`, and `explainer_targets_and_gradients.md`. Those documents have been marked SUPERSEDED (full content retained for git history) and their distinctive contributions have been merged or excerpted here. See the list at the end of this header.
 
@@ -461,7 +461,7 @@ return -prelog_h / sigma_t**2
 
 This fix is valid regardless of whether $H$ is PSD or not, because it never uses `s_log` or H's eigenstructure. After the fix: vertical leakage $< 10^{-7}$ (machine zero).
 
-**Current status.** The transpose bug fix makes `s_log` geometrically valid again. `score_target` now accepts `use_slog: bool = False`. The precompute script calls it with `use_slog=True` — `s_log` is the default for precomputed data generation (Phase 3.65 settled). The `prelog + project_G` fast path remains available for online training. Precomputed data from the Phase 3.6 run must be regenerated before re-training.
+**Current status.** The transpose bug fix makes `s_log` geometrically valid again. `score_target` now accepts `use_slog: bool = True` as the default. The precompute script calls it with `use_slog=True` — `s_log` is the default for precomputed data generation (Phase 3.65 settled). The `prelog + project_G` fast path remains available for online training. The Phase 3.6 precomputed data was regenerated on 2026-05-29 with the fixed code; bit-for-bit verified clean on 2026-06-29 via `scripts/check_precomputed_staleness.py` (`max_abs_diff = 0`).
 
 ### 12.3 Lesson: How to test absolute correctness, not just parity
 
@@ -475,7 +475,11 @@ This diagnostic is the definitive absolute-correctness check for `metric_tensor`
 
 ---
 
-## 13. Paths to Full Resolution (Future Work)
+## 13. Paths to Full Resolution and the Phase 4 Riemannian Fokker–Planck Residual
+
+> **Status of §13** (2026-06-29): §13.1 is settled (Phase 3 invariants). §§13.2–13.6 are a **DRAFT** harvested from the deep-dive workflow (2026-06-18) plus the Hsu §3.2 / De Bortoli 2022 / Diepeveen 2025 references. The math is internally consistent and the flat limit reduces to ScoreMD's Eq. 8. **It requires user sign-off before any Phase 4 code is written** (see `CLAUDE.md` do-not-do rule #1). After sign-off, §§13.2–13.6 become the implementation spec for `riemannian-scoremd/src/diffusion/manifold_fp.py`.
+
+### 13.1 Pragmatic repair status (Phase 3)
 
 The pragmatic repair (prelog + explicit `project_G` in `score_target`, Euclidean norm on the projected residual) restores internal consistency for denoising score matching on the current data regime. After the transpose bug fix, $H$ is PSD and `s_log` is geometrically valid. However, the Euclidean-norm loss still does not realize the full Riemannian $g$-norm loss (required for Phase 4), because the condition number of $H$ (~8e7 on BBA) causes NaN gradients in `manifold.inner`.
 
@@ -508,6 +512,126 @@ The log-density residual on a Riemannian manifold involves the Laplace–Beltram
 
 **Recommended immediate validation step before investing in Level 2**  
 Reproduce the core Diepeveen et al. 2024 experiments (w^δ-geodesics between distant adenylate kinase frames, barycentre + rank-1 approximation) using the current JAX implementation on the original 102-frame data. If RMSD remains comparable to the paper's ~3.85 Å threshold and the dominant biological transition is recovered, the practical geometry remains useful.
+
+---
+
+### 13.2 The Riemannian VP-SDE on $(\mathcal{M}, g_{w^\delta})$  [DRAFT]
+
+**Stratonovich form** (preferred — chain rule holds; diffeomorphism invariance automatic):
+$$dX_t \;=\; b(X_t, t)\,dt \;+\; g(t) \sum_{\alpha=1}^{\dim\mathcal{M}} E_\alpha(X_t) \circ dW_t^\alpha$$
+where $\{E_\alpha\}$ is a (locally defined) $g$-orthonormal frame on $T_x \mathcal{M}$ and $g(t) = \sqrt{\beta(t)}$. The generator is
+$$L \;=\; b \cdot \mathrm{grad}_\mathcal{M} \;+\; \tfrac{1}{2}\,g(t)^2\,\Delta_\mathcal{M}.$$
+
+**Drift.** The flat VP drift $-\tfrac12 \beta(t) X$ becomes
+$$\boxed{\; b(x, t) \;=\; \tfrac{1}{2}\beta(t)\,\log_\mathcal{M}(x_{\text{ref}};\, x) \;}$$
+where $x_{\text{ref}}$ is the horizontal-projected training-data centroid. Justification: in flat space, $-\tfrac12 \beta x = -\tfrac12 \beta \cdot \mathrm{grad}_x U_{\text{ref}}(x)$ for $U_{\text{ref}}(x) = \tfrac12 \|x - x_{\text{ref}}\|^2$. By Gauss's lemma on $(\mathcal{M}, g)$: $\mathrm{grad}_\mathcal{M} \tfrac12 d_\mathcal{M}(x, x_{\text{ref}})^2 = -\log_\mathcal{M}(x_{\text{ref}};\, x)$. In code, $\log_\mathcal{M} \approx s\_\log$ (third-order accurate via Thm. 7.2).
+
+**Forward transition kernel** (no closed form on curved $\mathcal{M}$). The project already samples via geodesic noising (Phase 2):
+$$x_t \;=\; s\_\exp\bigl(x_0,\; \tfrac{1}{2}\alpha(t)\sigma(t)\,v_{h,\text{unit}}\bigr), \qquad v_{h,\text{unit}} \in \mathcal{H}_{x_0}^E, \;\|v\|_E = 1.$$
+This is consistent with the generator $L$ above to leading order. The $0.5\times$ factor compensates for $s\_\exp$ internally calling $s\_\mathrm{geodesic}$ at $\tau = 2$ (§9 and `manifold_sde.py:137-138`).
+
+### 13.3 The Fokker–Planck equation  [DRAFT]
+
+The Kolmogorov forward equation (Hsu 2002 §3.2) is the formal adjoint of $L$ with respect to the $L^2(dV_g)$ pairing, where $dV_g = \sqrt{\det g}\, dx$ is the Riemannian volume measure:
+$$\boxed{\;\partial_t p_t \;=\; -\mathrm{div}_\mathcal{M}(b\,p_t) \;+\; \tfrac{1}{2}\,g(t)^2\,\Delta_\mathcal{M} p_t \;\quad (\star)}$$
+Using $\Delta_\mathcal{M}^* = \Delta_\mathcal{M}$ (self-adjoint on scalars) and $(V \cdot \mathrm{grad}_\mathcal{M})^* = -\mathrm{div}_\mathcal{M}(V \cdot)$. **No curvature term appears** in $(\star)$: the Bochner identity would only contribute if we wrote an evolution equation for $\mathrm{grad}_\mathcal{M} \log p$ as a 1-form, which we do not. The density $p_t$ here is with respect to $dV_g$, not the Lebesgue ambient measure.
+
+### 13.4 The log-density residual  [DRAFT]
+
+Substituting $p = e^\varphi$ ($\varphi = \log p$) into $(\star)$ and dividing by $p$, using $\Delta_\mathcal{M} e^\varphi / e^\varphi = \Delta_\mathcal{M} \varphi + \|\mathrm{grad}_\mathcal{M} \varphi\|_g^2$ and $\mathrm{div}_\mathcal{M}(bp)/p = \mathrm{div}_\mathcal{M}(b) + g(b, \mathrm{grad}_\mathcal{M}\varphi)$:
+$$\boxed{\;\partial_t \varphi \;=\; -\mathrm{div}_\mathcal{M}(b) \;-\; g(b, s) \;+\; \tfrac{1}{2}g(t)^2\!\bigl(\mathrm{div}_\mathcal{M}(s) \;+\; \|s\|_g^2\bigr) \;\quad (\star\star)}$$
+where $s := \mathrm{grad}_\mathcal{M} \varphi = \mathrm{grad}_\mathcal{M} \log p_t$ is the Riemannian score.
+
+This is the Riemannian analogue of ScoreMD's Eq. 8 (`scoremd/src/scoremd/diffusion/fp.py:344-372`). The substitution rule is **literal**:
+
+| Euclidean (ScoreMD Eq. 8) | Riemannian $(\star\star)$ |
+|---|---|
+| $-\mathrm{div}(f)$ | $-\mathrm{div}_\mathcal{M}(b)$ |
+| $-\langle f, \nabla\log p\rangle$ | $-g(b, s)$ |
+| $\tfrac{1}{2}g^2 \mathrm{div}(\nabla\log p)$ | $\tfrac{1}{2}g(t)^2 \mathrm{div}_\mathcal{M}(s)$ |
+| $\tfrac{1}{2}g^2 \|\nabla\log p\|^2$ | $\tfrac{1}{2}g(t)^2 \|s\|_g^2$ |
+
+**Where the CLAUDE.md / PLAN.md placeholder is wrong.** The placeholder
+$$\mathrm{div}_\mathcal{M}(s) \;=\; \mathrm{div}_{\text{flat}}(s) \;-\; s \cdot \mathrm{grad}_x\!\bigl(\tfrac{1}{2}\log\det g\bigr) \quad\text{[WRONG SIGN]}$$
+has a sign error. The correct coordinate identity is
+$$\mathrm{div}_\mathcal{M}(V) \;=\; \tfrac{1}{\sqrt{|g|}}\,\partial_i\bigl(\sqrt{|g|}\,V^i\bigr) \;=\; \mathrm{div}_{\text{flat}}(V) \;+\; V \cdot \mathrm{grad}_x\!\bigl(\tfrac{1}{2}\log\det g\bigr) \quad\text{[CORRECT, with }+\text{]}.$$
+Furthermore the placeholder is missing two terms: $-\mathrm{div}_\mathcal{M}(b)$ (which in flat space is the constant $d$ from $b = -x/2$, but on $\mathcal{M}$ is x-dependent and contains curvature information via the Laplacian of distance-squared) and the conversion $\langle f, \nabla\log p\rangle \to g(b, s)$ (Riemannian inner product, not Euclidean).
+
+### 13.5 Computing $\mathrm{div}_\mathcal{M}$ via projected sliced JVP (Hutchinson + JVP)  [DRAFT]
+
+For an extrinsically given vector field $V: \mathcal{M} \to T\mathcal{M} \subset \mathbb{R}^{n\times d}$, the **coordinate-free divergence** is
+$$\mathrm{div}_\mathcal{M}(V)(x) \;=\; \mathrm{tr}\!\bigl(P_x \circ \nabla^{\text{amb}} V \circ P_x\bigr)$$
+where $P_x$ is the horizontal projector (already implemented as `manifold.project_G(x, ·)`) and $\nabla^{\text{amb}} V \in \mathbb{R}^{nd \times nd}$ is the ambient Jacobian. Building the full Jacobian is $\mathcal{O}((nd)^3)$ memory — prohibitive at AK scale ($nd = 642 \Rightarrow 2.6 \times 10^8$ ops per sample).
+
+**The workhorse — Hutchinson + JVP estimator** (Diepeveen 2025 Algorithm 5/6; ScoreMD Eq. 12; De Bortoli `oxcsml/riemannian-score-sde`):
+$$\mathrm{tr}(P_x J P_x) \;=\; \mathbb{E}_{\varepsilon \sim \mathcal{N}(0, I)}\bigl[\langle \varepsilon,\, P_x J P_x \varepsilon\rangle\bigr] \;\approx\; \tfrac{1}{K} \sum_{k=1}^K \langle \varepsilon_k,\, P_x J P_x \varepsilon_k \rangle.$$
+Each slice costs: one `project_G` to make $\varepsilon$ tangent, one `jax.jvp` through $V$, one `project_G` to make $J\varepsilon$ tangent, one inner product. With $K=2$ probes total FP overhead is $\sim 3\text{-}5\times$ DSM forward, matching ScoreMD's reported 4× multiplier.
+
+**Weak (finite-difference) residual** — ScoreMD's preferred Stein-style replacement of $\mathrm{div}\, s$:
+$$\mathbb{E}_v\!\bigl[\mathrm{div}_\mathcal{M}(s_\theta)(x)\bigr] \;\approx\; \mathbb{E}_v\!\left[\frac{1}{\sigma}\, g_x\!\left(v,\; \frac{P_{x_+} s_\theta(x_+) - P_{x_-} s_\theta(x_-)}{2\sigma}\right)\right], \quad x_\pm = s\_\exp(x, \pm \sigma v),\; \sigma = 10^{-4}.$$
+Two `s_exp` calls per probe; horizontal projection at $x_\pm$ is a first-order parallel-transport approximation valid for small $\sigma$.
+
+### 13.6 The full Phase 4 residual, loss, and pseudocode  [DRAFT]
+
+Combining $(\star\star)$ with the conservative parameterisation $u_\theta = -E_\theta(x, t)$ (`PotentialTangentScoreModel` — needed because $\partial_t u_\theta$ requires a scalar potential):
+$$\boxed{\;R_\theta(x, t) \;=\; \partial_t u_\theta \;+\; \mathrm{div}_\mathcal{M}(b) \;+\; g_x(b, s_\theta) \;-\; \tfrac{1}{2}g(t)^2\!\bigl(\mathrm{div}_\mathcal{M}(s_\theta) \;+\; \|s_\theta\|_g^2\bigr)\;}$$
+$$\mathcal{L}_\mathrm{FP}(\theta) \;=\; \mathbb{E}_{t, x_t}\!\bigl[\lambda_\mathrm{FP} \cdot D^{-2}\, R_\theta(x_t, t)^2\bigr], \quad D = \dim\mathcal{M}.$$
+Use ScoreMD's two-probe unbiased trick $\mathcal{L}_\mathrm{FP} \approx \widetilde R(v) \cdot \widetilde R(v')$ for variance reduction.
+
+**Combined Phase 4 loss**: $\mathcal{L}(\theta) = \mathcal{L}_\mathrm{DSM}(\theta) + \alpha\,\mathcal{L}_\mathrm{FP}(\theta)$, $\alpha \approx 10^{-2}$ for BBA (start from ScoreMD's BBA λ_FP and tune).
+
+**Pseudocode skeleton** (full version targets `riemannian-scoremd/src/diffusion/manifold_fp.py`, ~150 lines):
+```python
+def sliced_div_M(V_fn, x, key, K=2, sigma=1e-4, manifold=None):
+    """Weak Riemannian divergence: K probes × (2 s_exp + 2 V evals + 2 project_G)."""
+    def one_slice(k):
+        eps = jax.random.normal(k, x.shape)
+        v   = manifold.project_G(x, eps)
+        x_p = manifold.s_exp(x,  sigma * v)
+        x_m = manifold.s_exp(x, -sigma * v)
+        Vp  = manifold.project_G(x, V_fn(x_p))   # 1st-order parallel transport
+        Vm  = manifold.project_G(x, V_fn(x_m))
+        return jnp.sum(v * (Vp - Vm)) / (2.0 * sigma)
+    return jnp.mean(jax.vmap(one_slice)(jax.random.split(key, K)))
+
+def manifold_fp_residual(params, x, t, key, manifold, beta_fn, x_ref, h_d=5e-4, sigma=1e-4):
+    beta_t = beta_fn(t)
+    b      = 0.5 * beta_t * manifold.s_log(x_ref, x)
+    u_fn   = lambda y, s: potential_model.apply(params, y, s)
+    s_th   = manifold.project_G(x, jax.grad(u_fn, argnums=0)(x, t))
+    dt_u   = (u_fn(x, t + h_d) - u_fn(x, t - h_d)) / (2.0 * h_d)
+    H      = jax.lax.stop_gradient(manifold.metric_tensor(x))   # avoid eigh backprop
+    s_norm = jnp.einsum('i,ij,j->', s_th, H, s_th)
+    g_bs   = jnp.einsum('i,ij,j->', b, H, s_th)
+    k1, k2 = jax.random.split(key)
+    div_s  = sliced_div_M(lambda y: manifold.project_G(y, jax.grad(u_fn,0)(y, t)), x, k1, manifold=manifold)
+    div_b  = sliced_div_M(lambda y: 0.5 * beta_t * manifold.s_log(x_ref, y), x, k2, manifold=manifold)
+    return dt_u + div_b + g_bs - 0.5 * beta_t * (div_s + s_norm)
+```
+
+**Numerical-stability notes** (mandatory):
+- `jax.lax.stop_gradient(metric_tensor(x))` inside $\|s\|_g^2$ is **required** — backprop through eigh of an $H$ with $\mathrm{cond} \approx 2.4 \times 10^6$ NaNs out (Phase 3.66, §10).
+- Alternative: pre-compute the orthonormal basis $E$ at $x$ (existing primitive), express $s$ in this basis $\tilde s = E^\top s$, then $\|s\|_g^2 = \|\tilde s\|_E^2$ (Euclidean in the basis).
+
+**Cost** ($n=28$ BBA): ~5–8× DSM step (matches ScoreMD's 4× plus the manifold's $s\_\exp$ cost). ($n=214$ AK): ~10–15× — dominated by `s_exp`/`s_log`. Mitigation: precompute exp-perturbed pairs once per epoch (analogue of `precompute_noised_data.py`).
+
+**Validation plan** (before plugging into BBA training):
+1. **Sign check on $\mathrm{div}_\mathcal{M}$**: in the flat limit $H = I$, compute $\mathrm{div}_\mathcal{M}(b)$ for $b = -x$ — should give $-\dim\mathcal{M}$. Verify the JAX implementation returns this at small $\sigma$.
+2. **$\mathbb{S}^2$ vMF closed-form**: vMF density has closed-form score $s = \kappa(\mu - (x \cdot \mu) x)$. At the true score $R_\theta = 0$ (up to Hutchinson variance); rises sharply as $\theta$ is perturbed. Variance scales $\propto 1/K$.
+3. **Weak vs exact divergence at $D = 78$ (BBA)**: compute exact via `jax.jacobian`, weak via sliced. Should agree within 5% at $K=8$, $\sigma=10^{-4}$.
+4. **Heat-kernel sanity on $\mathbb{S}^2$**: initialise $u_0(x) = -\tfrac12 d^2(x_0, x) / \epsilon$, evolve via $(\star\star)$, check Riemannian heat kernel emerges.
+
+**Hard caveats**:
+- Itô vs Stratonovich: $(\star)$ is the Itô form. The project uses `ManifoldEulerMaruyama` (Itô) → keep as written.
+- Volume-form ambiguity: $p$ in $(\star)$ is w.r.t. $dV_g$, not Lebesgue. Project's existing $\mathrm{score\_target} = -\mathrm{prelog}/\sigma^2$ (and the $s\_\log$ variant) corresponds to the $dV_g$ convention, so $(\star\star)$ applies directly without a Jacobian-of-volume correction.
+
+**Primary references**:
+- Hsu, *Stochastic Analysis on Manifolds*, AMS 2002, §3.2 — Kolmogorov forward.
+- De Bortoli et al. 2022, Riemannian SBGM — practical template; code at `oxcsml/riemannian-score-sde`.
+- Diepeveen et al. 2025 (arXiv:2410.01950) — sliced JVP divergence (Algorithm 5/6); not the $w^\delta$ paper.
+- Wikipedia, *Stochastic analysis on manifolds* — confirms $\tfrac12 \Delta_\mathcal{M}$ generator.
+
+**Bottom line**: $(\star\star)$ is the Riemannian FP residual. The math is settled in this draft. What remains is **user sign-off** of §§13.2–13.6, followed by a ~150-line JAX implementation (`riemannian-scoremd/src/diffusion/manifold_fp.py`) that mirrors `oxcsml/riemannian-score-sde/losses.py` ISM loss with `manifold.project_G` as the projector.
 
 ---
 

@@ -5,3 +5,11 @@ __pycache__/
 .DS_Store
 *.npz
 *.npy
+
+# Checkpoints and training artifacts
+checkpoints/
+
+# Diagnostic and internal analysis artifacts
+claude-diagnostic/
+grok-diagnostic/
+diagnostics/
